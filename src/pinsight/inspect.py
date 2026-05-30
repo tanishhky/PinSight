@@ -24,6 +24,13 @@ def inspect_chain(data_dir: Path, underlying: str, expiry: date) -> dict:
     if df.empty:
         return {"contracts": 0}
 
+    # If multiple snapshots accumulated, default to latest.
+    if "_snapshot_ts" in df.columns:
+        latest = df["_snapshot_ts"].max()
+        df = df[df["_snapshot_ts"] == latest]
+        obs.event(channel="fit", kind="inspect.snapshot_picked", level="DEBUG",
+                  snapshot_ts=str(latest))
+
     underlying_price = float(df["underlying_price"].iloc[0])
     calls = df[df["contract_type"] == "call"].copy()
     puts = df[df["contract_type"] == "put"].copy()
