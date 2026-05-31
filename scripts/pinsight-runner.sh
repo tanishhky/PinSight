@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-PROJECT="/Users/tanishkyadav/Documents/SecondBrain/GitHub/PinSight"
+PROJECT="/Users/tanishkyadav/dev/PinSight"
 PY="${PROJECT}/.venv/bin/python"
 SYMBOL="${SYMBOL:-SPY}"
 

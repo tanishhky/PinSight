@@ -14,7 +14,44 @@ PinSight studies zero-days-to-expiration (0DTE) options on SPX/SPY with three co
 
 ## Status
 
-Pre-alpha. Scaffold + research foundation only. Nothing here trades yet.
+**M1 shipped (2026-05-30):** data ingestion (Yahoo + Polygon adapter), Parquet persistence, flagged-contract inspector, eval-flags backtester, launchd automation (morning/midday/close, Mon-Fri). M2 (RND engine), M3 (pricing), M4 (flow engine) are next.
+
+**Operationally:** the project lives at `~/dev/PinSight/`. Three launchd jobs auto-run on the schedule below.
+
+## What's wired up today
+
+| Component | Status |
+|---|---|
+| `pinsight ping` / `fetch-chain` / `list-expiries` / `inspect-chain` / `eval-flags` / `monday-workflow` | shipped |
+| Yahoo Finance adapter (free, no key) | shipped |
+| Polygon adapter (REST, rate-limited, telemetry) | shipped but blocked by free tier on options market data |
+| Parquet persistence with append-on-resnapshot | shipped |
+| Observability spine (JSONL events: `obs.timed`, `obs.event`, run summary) | shipped |
+| Auto-runs Mon-Fri | shipped via launchd |
+| RND engine (BL second-deriv + SVI smoothing + BKM cross-check) | planned (M2) |
+| Pricing engine | planned (M3) |
+| Flow engine | planned (M4) |
+
+## Auto-schedule (launchd, ET, weekdays only)
+
+| Job | Time (ET) | Action |
+|---|---|---|
+| `com.tanishk.pinsight.morning` | 09:35 | Pull nearest-expiry SPY chain, inspect, persist |
+| `com.tanishk.pinsight.midday` | 12:30 | Re-fetch + inspect (flow evolution since open) |
+| `com.tanishk.pinsight.close` | 16:10 | Final snapshot + `eval-flags` against actual close |
+
+US-market holidays handled by a hardcoded calendar in `scripts/pinsight-runner.sh` (refresh yearly).
+
+## Install / install autorun
+
+```
+cd ~/dev/PinSight
+python3 -m venv .venv
+.venv/bin/pip install -e .
+./scripts/launchd/install.sh
+```
+
+Requires Full Disk Access granted to `/bin/bash` on macOS Sequoia/Sonoma if the project lives in `~/Documents/`. Living in `~/dev/` (the current setup) sidesteps the TCC restriction.
 
 ## Why 0DTE
 
