@@ -13,6 +13,8 @@ import sys
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+import pandas as pd
+
 from . import config as cfg
 from . import obs
 from .data.chain_normalizer import normalize_polygon_chain
@@ -88,6 +90,103 @@ def cmd_fetch_chain(args: argparse.Namespace, c: cfg.Config) -> int:
     return 0
 
 
+def cmd_paper_tick(args: argparse.Namespace, c: cfg.Config) -> int:
+    """One-shot: fetch the chain, run paper.tick, log result."""
+    from . import paper
+    underlying = args.symbol.upper()
+    expiry = _parse_date(args.expiry) if args.expiry else None
+    snapshot_ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    df = yahoo.fetch_chain(underlying, expiry=expiry)
+    if df is None or df.empty:
+        obs.event(channel="run", kind="paper_tick.fetch_empty", level="WARNING")
+        return 0
+    chosen_expiry = expiry or date.fromisoformat(str(df["expiry"].iloc[0]))
+    write_chain(df, c.data_dir, underlying=underlying,
+                 expiry=chosen_expiry, snapshot_ts=snapshot_ts)
+
+    # Re-read from disk so we get _snapshot_ts column and consistent shape.
+    chain_path = c.data_dir / "chains" / underlying / f"{chosen_expiry.isoformat()}.parquet"
+    chain_df = pd.read_parquet(chain_path)
+    result = paper.tick(c.data_dir, chain_df,
+                         as_of_ts=snapshot_ts,
+                         expiry_iso=chosen_expiry.isoformat())
+    obs.event(channel="run", kind="paper_tick.done", level="INFO", **result)
+    return 0
+
+
+def cmd_poll(args: argparse.Namespace, c: cfg.Config) -> int:
+    """Long-running daemon: fetch chain + paper-tick on a fixed interval."""
+    import time
+    from . import paper
+
+    underlying = args.symbol.upper()
+    interval = max(30, int(args.interval))
+    market_hours_only = bool(args.market_hours_only)
+
+    obs.event(channel="run", kind="poll.start", level="INFO",
+              underlying=underlying, interval_s=interval,
+              market_hours_only=market_hours_only)
+
+    iteration = 0
+    while True:
+        loop_start = time.time()
+        iteration += 1
+        as_of_ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+        # Optional market-hours gate (rough — UTC; 13:30-20:00 UTC ≈ 09:30-16:00 ET
+        # during US summer, 14:30-21:00 in winter; we use the broader summer
+        # window since most of the year is EDT and false-positives off-hours
+        # are harmless — they just no-op on stale chains).
+        now_dt = datetime.now(timezone.utc)
+        if market_hours_only:
+            weekday = now_dt.weekday()  # 0=Mon, 6=Sun
+            hour_utc = now_dt.hour + now_dt.minute / 60.0
+            if weekday >= 5 or hour_utc < 13.5 or hour_utc > 20.25:
+                obs.event(channel="run", kind="poll.outside_market_hours",
+                          level="DEBUG", weekday=weekday, hour_utc=hour_utc)
+                time.sleep(interval)
+                continue
+
+        # 1. Fetch chain
+        try:
+            df = yahoo.fetch_chain(underlying)
+        except Exception as exc:
+            obs.event(channel="error", kind="poll.fetch_fail",
+                      level="WARNING", err=str(exc))
+            df = None
+
+        if df is not None and not df.empty:
+            chosen_expiry = date.fromisoformat(str(df["expiry"].iloc[0]))
+            try:
+                write_chain(df, c.data_dir, underlying=underlying,
+                             expiry=chosen_expiry, snapshot_ts=as_of_ts)
+            except Exception as exc:
+                obs.event(channel="error", kind="poll.persist_fail",
+                          level="WARNING", err=str(exc))
+
+            # 2. Paper tick
+            try:
+                chain_path = c.data_dir / "chains" / underlying / f"{chosen_expiry.isoformat()}.parquet"
+                chain_df = pd.read_parquet(chain_path)
+                result = paper.tick(c.data_dir, chain_df,
+                                     as_of_ts=as_of_ts,
+                                     expiry_iso=chosen_expiry.isoformat())
+                obs.event(channel="fit", kind="poll.tick_done",
+                          level="INFO", iteration=iteration, **result)
+            except Exception as exc:
+                obs.event(channel="error", kind="poll.tick_fail",
+                          level="WARNING", err=str(exc),
+                          exc_type=type(exc).__name__)
+        else:
+            obs.event(channel="run", kind="poll.no_chain", level="DEBUG")
+
+        # Sleep until next tick.
+        elapsed = time.time() - loop_start
+        sleep_for = max(0.5, interval - elapsed)
+        time.sleep(sleep_for)
+
+
 def cmd_monday_workflow(args: argparse.Namespace, c: cfg.Config) -> int:
     """Convenience: fetch today's 0DTE chain, persist, inspect.
 
@@ -161,6 +260,21 @@ def build_parser() -> argparse.ArgumentParser:
     mw.add_argument("--eval", action="store_true",
                     help="Run end-of-day evaluation (use after close, with full chain stored)")
     mw.set_defaults(func=cmd_monday_workflow)
+
+    pt = sub.add_parser("paper-tick",
+                        help="One-shot paper trader tick (fetch chain + decide)")
+    pt.add_argument("symbol", default="SPY", nargs="?")
+    pt.add_argument("--expiry", help="YYYY-MM-DD; defaults to nearest")
+    pt.set_defaults(func=cmd_paper_tick)
+
+    poll = sub.add_parser("poll",
+                          help="Long-running daemon: fetch chain + paper-tick every N seconds")
+    poll.add_argument("symbol", default="SPY", nargs="?")
+    poll.add_argument("--interval", type=int, default=90,
+                       help="Seconds between ticks (default 90)")
+    poll.add_argument("--market-hours-only", action="store_true",
+                       help="Only run during US equity market hours (09:30-16:00 ET)")
+    poll.set_defaults(func=cmd_poll)
 
     return p
 

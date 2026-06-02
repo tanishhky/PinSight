@@ -8,7 +8,7 @@ SRC="$(cd "$(dirname "$0")" && pwd)"
 DST="$HOME/Library/LaunchAgents"
 mkdir -p "$DST"
 
-for label in morning midday close; do
+for label in morning midday close poll; do
     plist="com.tanishk.pinsight.${label}.plist"
     src_file="$SRC/$plist"
     dst_file="$DST/$plist"
