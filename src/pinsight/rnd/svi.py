@@ -90,24 +90,66 @@ def _g_function(k: np.ndarray, p: SVIParams) -> np.ndarray:
 
 # ── Initial parameter heuristic ───────────────────────────────────────────
 
+def _quadratic_warm_start(k: np.ndarray, ivs: np.ndarray,
+                           T: float) -> tuple[float, ...]:
+    """Fit σ_IV(k) = a' + b'k + c'k² in IV space (closed-form OLS), then
+    translate to SVI params (a, b, ρ, m, σ).
+
+    Mapping (small-σ_SVI limit, where (k-m) dominates √((k-m)²+σ²)):
+        ATM IV ≈ √(a/T)    ⇒  a ≈ (a')² · T
+        Wing slopes: dσ/dk ≈ b'/(2σ_atm)   right
+                              -b'/(2σ_atm)  left
+        Right wing total-variance slope = b·(1+ρ),
+        Left  wing total-variance slope = b·(1-ρ),
+        Both in *w*-space.
+
+    We use sym/asym of the wings to estimate b and ρ:
+        avg_slope ≈ (right_slope + left_slope)/2 = b
+        skew      ≈ (right_slope - left_slope)/2 = b·ρ
+        ⇒ ρ ≈ skew / b
+    """
+    A = np.column_stack([np.ones_like(k), k, k * k])
+    coef, *_ = np.linalg.lstsq(A, ivs, rcond=None)
+    a_q, b_q, c_q = coef
+    # ATM IV
+    sigma_atm = max(float(a_q), 0.01)
+    a0 = float(sigma_atm ** 2 * T)
+    # m: the IV-space curve minimum is at k_min = -b'/(2c').
+    # If c' ≤ 0 (no curvature or inverted), default m to 0 (ATM).
+    if c_q > 1e-6:
+        m0 = float(-b_q / (2 * c_q))
+        m0 = float(np.clip(m0, -2.0, 2.0))
+    else:
+        m0 = 0.0
+    # Estimate wing slopes in w-space by evaluating the quadratic at the
+    # observed range endpoints.
+    k_left, k_right = float(k.min()), float(k.max())
+    iv_left = max(a_q + b_q * k_left + c_q * k_left ** 2, 1e-3)
+    iv_right = max(a_q + b_q * k_right + c_q * k_right ** 2, 1e-3)
+    iv_min = max(a_q + b_q * m0 + c_q * m0 ** 2, 1e-3)
+    w_left = iv_left ** 2 * T
+    w_right = iv_right ** 2 * T
+    w_min = iv_min ** 2 * T
+    slope_right = (w_right - w_min) / max(abs(k_right - m0), 0.01)
+    slope_left = (w_left - w_min) / max(abs(m0 - k_left), 0.01)
+    # b ≈ (slope_right + slope_left)/2, ρ ≈ (slope_right - slope_left)/(2b)
+    b0 = float(max((slope_right + slope_left) / 2.0, 1e-5))
+    rho0 = float(np.clip((slope_right - slope_left) / (2.0 * b0), -0.95, 0.95))
+    sigma0 = 0.05
+    return a0, b0, rho0, m0, sigma0
+
+
 def _initial_guess(k: np.ndarray, w: np.ndarray) -> tuple[float, ...]:
-    """A reasonable starting point. The optimiser is fairly robust to bad
-    starts on well-shaped smiles, but the ATM-IV-anchored heuristic below
-    converges in ~30 iterations on typical SPY chains."""
+    """Legacy heuristic kept as one of the multi-start seeds."""
     w_min = float(np.min(w))
     w_max = float(np.max(w))
     k_at_min = float(k[np.argmin(w)])
-    # a anchors the vertical level
     a0 = max(w_min * 0.5, 1e-6)
-    # b sets the wing slope; estimate from the steeper side
     spread = w_max - w_min
     k_range = max(float(k.max() - k.min()), 0.01)
     b0 = max(spread / k_range, 1e-3)
-    # rho: negative if right wing is steeper than left (skew); 0 default
     rho0 = -0.3
-    # m: the minimum of the smile
     m0 = k_at_min
-    # sigma: width parameter; start at chain-typical 0.1
     sigma0 = 0.1
     return a0, b0, rho0, m0, sigma0
 
@@ -116,23 +158,14 @@ def _initial_guess(k: np.ndarray, w: np.ndarray) -> tuple[float, ...]:
 
 def _objective(theta: np.ndarray, k: np.ndarray, w_obs: np.ndarray,
                T: float) -> float:
-    """RMSE in IV-space.
-
-    Earlier draft minimised in total-variance space (w = σ²·T), but for
-    0DTE the total-variance numbers are ~1e-5 and the optimiser's
-    gradient steps were below the convergence floor. Working in IV-space
-    keeps the objective at order ~1 and the fit actually moves.
-    """
+    """RMSE in IV-space, unweighted (avoid ATM-bias trap that collapsed
+    the fit to a constant on real chains)."""
     a, b, rho, m, sigma = theta
     p = SVIParams(a=a, b=b, rho=rho, m=m, sigma=sigma)
     w_pred = p.total_variance(k)
-    # Convert both to IV.
     sigma_pred = np.sqrt(np.maximum(w_pred, 1e-12) / T)
     sigma_obs = np.sqrt(w_obs / T)
-    # Weight ATM heavier — that's where the signal lives and where the
-    # paper trader actually opens positions.
-    weights = np.exp(-4.0 * np.abs(k))
-    return float(np.sum(weights * (sigma_pred - sigma_obs) ** 2))
+    return float(np.sum((sigma_pred - sigma_obs) ** 2))
 
 
 def _constraints_ok(theta: np.ndarray) -> bool:
@@ -178,33 +211,70 @@ def fit(strikes: np.ndarray, ivs: np.ndarray, *,
     k = np.log(strikes / F)
     w_obs = (ivs ** 2) * T
 
-    theta0 = (np.array([initial.a, initial.b, initial.rho, initial.m, initial.sigma])
-              if initial is not None
-              else np.array(_initial_guess(k, w_obs)))
-
+    # Bounds — keep b away from 0 so the fit can't collapse to a constant.
     bounds = [
-        (1e-8, 5.0),    # a
-        (1e-6, 5.0),    # b
-        (-0.999, 0.999), # rho
-        (-2.0, 2.0),    # m
-        (1e-4, 2.0),    # sigma
+        (1e-8, 5.0),        # a
+        (1e-5, 5.0),        # b — wider lower bound vs legacy 1e-6
+        (-0.95, 0.95),      # rho — stay away from singular ±1
+        (-1.0, 1.0),        # m — stay within reasonable log-moneyness
+        (1e-3, 2.0),        # sigma — wider lower bound vs legacy 1e-4
     ]
 
-    # Two-stage fit: Nelder-Mead first (gradient-free, robust to bad
-    # init) → polish with L-BFGS-B for tight convergence.
-    nm = minimize(
-        _objective, theta0, args=(k, w_obs, T),
-        method="Nelder-Mead",
-        options={"maxiter": 2000, "xatol": 1e-8, "fatol": 1e-12,
-                  "adaptive": True},
-    )
-    result = minimize(
-        _objective, nm.x, args=(k, w_obs, T),
-        method="L-BFGS-B", bounds=bounds,
-        options={"maxiter": 500, "ftol": 1e-14, "gtol": 1e-10},
-    )
-    theta = result.x
-    converged = bool(result.success or nm.success) and _constraints_ok(theta)
+    # Multi-start seeds: quadratic warm-start (data-driven), legacy
+    # heuristic, plus two manual seeds biased for downside-skew SPY.
+    seeds = []
+    try:
+        seeds.append(np.array(_quadratic_warm_start(k, ivs, T)))
+    except Exception:
+        pass
+    seeds.append(np.array(_initial_guess(k, w_obs)))
+    if initial is not None:
+        seeds.insert(0, np.array([initial.a, initial.b, initial.rho,
+                                     initial.m, initial.sigma]))
+    # Manual seeds — typical 0DTE SPY with downside skew (rho < 0,
+    # m to the right of ATM so smile minimum is OTM-call side).
+    seeds.append(np.array([float(np.mean(w_obs)) * 0.7,
+                             1e-4, -0.5, 0.05, 0.02]))
+    seeds.append(np.array([float(np.mean(w_obs)) * 0.5,
+                             5e-5, -0.7, 0.10, 0.05]))
+
+    def _clip_to_bounds(theta):
+        return np.array([float(np.clip(v, lo, hi))
+                          for v, (lo, hi) in zip(theta, bounds)])
+
+    best_theta = None
+    best_loss = float("inf")
+    best_nm_success = False
+    total_iter = 0
+    for seed in seeds:
+        seed = _clip_to_bounds(seed)
+        nm = minimize(
+            _objective, seed, args=(k, w_obs, T),
+            method="Nelder-Mead",
+            options={"maxiter": 3000, "xatol": 1e-9, "fatol": 1e-14,
+                      "adaptive": True},
+        )
+        lb = minimize(
+            _objective, _clip_to_bounds(nm.x), args=(k, w_obs, T),
+            method="L-BFGS-B", bounds=bounds,
+            options={"maxiter": 500, "ftol": 1e-14, "gtol": 1e-10},
+        )
+        candidate = lb.x if lb.fun < nm.fun else nm.x
+        loss = float(min(lb.fun, nm.fun))
+        if loss < best_loss and _constraints_ok(candidate):
+            best_loss = loss
+            best_theta = candidate
+            best_nm_success = bool(nm.success or lb.success)
+            total_iter += int(nm.nit + (lb.nit if hasattr(lb, "nit") else 0))
+
+    if best_theta is None:
+        # All seeds failed feasibility; fall back to the last NM result.
+        best_theta = nm.x
+        best_nm_success = bool(nm.success)
+        total_iter = int(nm.nit)
+
+    theta = best_theta
+    converged = best_nm_success and _constraints_ok(theta)
 
     p = SVIParams(a=theta[0], b=theta[1], rho=theta[2],
                   m=theta[3], sigma=theta[4])
@@ -219,7 +289,7 @@ def fit(strikes: np.ndarray, ivs: np.ndarray, *,
     return SVIFit(
         params=p, k_data=k, w_data=w_obs, w_fit=w_fit, rmse=rmse,
         butterfly_violations=butterfly_violations,
-        converged=converged, iterations=int(result.nit),
+        converged=converged, iterations=total_iter,
     )
 
 

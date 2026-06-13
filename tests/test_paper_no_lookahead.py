@@ -73,7 +73,7 @@ def _open_positions_signature(positions: list[dict]) -> list[tuple]:
             continue
         sig.append((p["kind"], float(p["strike"]),
                     int(p["n_contracts"]),
-                    round(float(p["entry_price"]), 4),
+                    round(float(p["entry_fill_price"]), 4),
                     round(float(p["fair_at_entry"]), 4)))
     return sorted(sig)
 
@@ -131,3 +131,61 @@ def test_rnd_extract_assertion_fires_on_future_data():
     df = pd.DataFrame(rows)
     with pytest.raises(AssertionError, match="LOOKAHEAD"):
         extract(df, spot=600.0, as_of_ts=as_of_ts, expiry_iso="2026-06-01")
+
+
+def test_lookahead_assertion_handles_timestamp_format_mixing():
+    """REGRESSION (2026-06-03): the assertion previously used
+    lexicographic string comparison on ISO 8601 strings. Same instant
+    written as "Z" vs "+00:00" triggered a false-positive LOOKAHEAD
+    VIOLATION because 'Z' > '+' in ASCII.
+
+    Post-fix: parse both sides as datetime and compare numerically.
+    """
+    # Snapshot equals as_of_ts in wall-clock — different suffix style.
+    rows = []
+    for K in range(595, 606):
+        rows.append({
+            "ticker": f"SPY{K}C", "underlying": "SPY",
+            "contract_type": "call", "strike": float(K),
+            "expiry": "2026-06-01", "bid": 1.0, "ask": 1.1,
+            "mid": 1.05, "volume": 100, "open_interest": 1000,
+            "iv": 0.15, "in_the_money": False,
+            "underlying_price": 600.0,
+            "quote_ts": "2026-06-01T14:00:00Z",
+            "_snapshot_ts": "2026-06-01T14:00:00Z",   # Z suffix
+        })
+    df = pd.DataFrame(rows)
+    # Must not raise (snapshot == as_of_ts in wall-clock time).
+    # Returns None because the flat-IV synthetic chain fails the R² gate,
+    # but the key behaviour is that the assertion does NOT fire.
+    try:
+        extract(df, spot=600.0,
+                as_of_ts="2026-06-01T14:00:00+00:00",   # +00:00 suffix
+                expiry_iso="2026-06-01")
+    except AssertionError as exc:
+        if "LOOKAHEAD" in str(exc):
+            raise AssertionError(
+                f"REGRESSION: lookahead assertion fired on equal "
+                f"timestamps with mixed Z/+00:00 suffixes: {exc}") from exc
+
+
+def test_lookahead_assertion_fires_with_mixed_suffix_future_data():
+    """The OTHER direction: even with mixed Z vs +00:00 suffixes, a
+    snapshot that is genuinely in the future MUST trigger the assertion."""
+    rows = []
+    for K in range(595, 606):
+        rows.append({
+            "ticker": f"SPY{K}C", "underlying": "SPY",
+            "contract_type": "call", "strike": float(K),
+            "expiry": "2026-06-01", "bid": 1.0, "ask": 1.1,
+            "mid": 1.05, "volume": 100, "open_interest": 1000,
+            "iv": 0.15, "in_the_money": False,
+            "underlying_price": 600.0,
+            "quote_ts": "2026-06-01T15:00:00Z",
+            "_snapshot_ts": "2026-06-01T15:00:00Z",  # 1 hr in the future
+        })
+    df = pd.DataFrame(rows)
+    with pytest.raises(AssertionError, match="LOOKAHEAD"):
+        extract(df, spot=600.0,
+                as_of_ts="2026-06-01T14:00:00+00:00",
+                expiry_iso="2026-06-01")

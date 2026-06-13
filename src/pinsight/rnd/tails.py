@@ -1,79 +1,93 @@
 """Tail extrapolation for the risk-neutral density.
 
-Beyond the traded strike range, q(K) extracted via Breeden-Litzenberger is
-unreliable (no data + smile extrapolation noise). Two approaches:
+Production path (post-fix 2026-06-03):
+  1. Try Figlewski (2010) GEV tails: fit (ξ, μ, σ) at each anchor using
+     PDF match + CDF match + local-slope match (three conditions, three
+     parameters).
+  2. Fall back to exponential-decay tails if the GEV fit either fails to
+     converge OR produces a tail whose PDF at the anchor diverges from
+     the BL anchor by more than 20 %.
 
-  v0 — **Exponential-decay tails**: q(K) = q(anchor) · exp(-|K-anchor|/λ),
-       where λ matches the LOCAL log-slope of q at the anchor. Simple,
-       always positive, smooth, no optimisation pathologies.
+Method (right tail):
+  - Anchor: K_R = strike at the 95th percentile of the BL CDF.
+  - Targets at anchor:
+      f_target = q(K_R)                       (PDF match)
+      F_target = CDF(K_R) = 0.95              (CDF match)
+      slope_target = d log q / dK at K_R       (slope match)
+  - Solve via Nelder-Mead in 3D.
 
-  v1 — **Figlewski (2010) GEV tails**: fit Generalised Extreme Value
-       distributions to each wing using PDF + CDF + slope matching at
-       the anchor. The literature-standard approach. Has subtle
-       implementation traps with left-tail reflection — kept stubbed
-       below for now (returns exp-decay fall-through).
+Method (left tail) — reflection convention:
+  - We fit a GEV in the "reflected" strike coordinate K' = 2·K_L − K so
+    that left-tail mass below K_L in original coordinates corresponds
+    to right-tail mass above K_L in reflected coordinates.
+  - Targets:
+      f_target = q(K_L)                       (PDF invariant under K→2K_L−K)
+      F_target = 1 − CDF(K_L) ≈ 0.95          (mass to the right of K_L in K′)
+      slope_target = −d log q / dK at K_L     (slope flips sign under reflection)
 
-The active implementation is exp-decay.  TODO #PIN-RND-1: implement GEV
-properly with Figlewski's reflection convention.
+GEV functional form:
+    f(x; ξ, μ, σ) = (1/σ) · (1 + ξ(x-μ)/σ)^(-1/ξ - 1)
+                          · exp(-(1 + ξ(x-μ)/σ)^(-1/ξ))
+    F(x; ξ, μ, σ) = exp(-(1 + ξ(x-μ)/σ)^(-1/ξ))
+For ξ→0 (Gumbel limit) both become exponentials of -exp(-z).
 
-Method:
-  1. From the BL density inside the traded range, identify two anchor
-     points α_L and α_R in each tail (Figlewski: α_L at the 5th percentile,
-     α_R at the 95th).
-  2. Fit a GEV tail in each wing such that:
-       (a) the tail PDF matches q at the anchor (continuity),
-       (b) the tail CDF matches the BL CDF at the anchor,
-       (c) one additional moment condition (we use the local slope of the
-           log-density) closes the system.
-  3. Stitch: piecewise q = GEV_left for K < α_L, BL q for K ∈ [α_L, α_R],
-     GEV_right for K > α_R. Renormalise the whole thing to 1.
-
-GEV PDF:
-    f(x; ξ, μ, σ) = (1/σ) · (1 + ξ(x-μ)/σ)^(-1/ξ - 1) · exp(-(1 + ξ(x-μ)/σ)^(-1/ξ))
-
-For ξ > 0  → Fréchet tail (heavy)
-For ξ = 0  → Gumbel tail (light)
-For ξ < 0  → Weibull tail (bounded)
-
-For SPY equity index the right tail is roughly Gumbel/light-Fréchet
-(ξ ∈ [0, 0.2]) and the left tail is heavier (ξ ∈ [0.1, 0.4]) — crash
-risk.
-
-Reference: Figlewski (2010) "Estimating the Implied Risk-Neutral Density".
+Reference: Figlewski (2010) "Estimating the Implied Risk-Neutral Density."
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional, Tuple, Union
 
 import numpy as np
 from scipy.optimize import minimize
 
 
+# ── Dataclasses ──────────────────────────────────────────────────────────
+
 @dataclass(frozen=True)
 class GEVTail:
-    """One-sided GEV tail."""
-    side: str          # 'left' or 'right'
-    xi: float          # shape
-    mu: float          # location
-    sigma: float       # scale
-    anchor_K: float    # the strike where this tail attaches
-    anchor_q: float    # the density at the anchor (continuity target)
+    """One-sided GEV tail (Figlewski 2010)."""
+    side: str
+    xi: float
+    mu: float
+    sigma: float
+    anchor_K: float
+    anchor_q: float
+    fit_loss: float
+    converged: bool
 
+
+@dataclass(frozen=True)
+class ExpTail:
+    """One-sided exponential-decay fallback tail."""
+    side: str
+    anchor_K: float
+    anchor_q: float
+    lam: float
+    reason: str = ""
+
+
+Tail = Union[GEVTail, ExpTail]
+
+
+# ── GEV PDF/CDF (vectorised) ────────────────────────────────────────────
 
 def _gev_pdf(x: np.ndarray, xi: float, mu: float, sigma: float) -> np.ndarray:
-    """GEV PDF; vectorised, handles ξ=0 Gumbel limit."""
+    """GEV PDF. Handles ξ→0 Gumbel limit."""
     z = (x - mu) / sigma
     if abs(xi) < 1e-8:
-        # Gumbel
         return np.exp(-z - np.exp(-z)) / sigma
     t = 1.0 + xi * z
-    # Domain check: 1 + ξz > 0
-    mask = t > 0
     out = np.zeros_like(x, dtype=float)
-    valid = t[mask]
-    out[mask] = (valid ** (-1.0 / xi - 1.0)
-                  * np.exp(-valid ** (-1.0 / xi))) / sigma
+    valid = t > 0
+    if not np.any(valid):
+        return out
+    tv = t[valid]
+    with np.errstate(over="ignore", invalid="ignore"):
+        out[valid] = (tv ** (-1.0 / xi - 1.0)
+                       * np.exp(-tv ** (-1.0 / xi))) / sigma
+    out = np.where(np.isfinite(out), out, 0.0)
     return out
 
 
@@ -82,95 +96,129 @@ def _gev_cdf(x: np.ndarray, xi: float, mu: float, sigma: float) -> np.ndarray:
     if abs(xi) < 1e-8:
         return np.exp(-np.exp(-z))
     t = np.maximum(1.0 + xi * z, 0.0)
-    return np.exp(-(t ** (-1.0 / xi)))
+    with np.errstate(over="ignore", invalid="ignore"):
+        out = np.exp(-(t ** (-1.0 / xi)))
+    return np.where(np.isfinite(out), out, np.where(t > 0, 1.0, 0.0))
 
 
-def _fit_tail(side: str, anchor_K: float, anchor_q: float, anchor_cdf: float,
-               q_slope: float, K_lo: float, K_hi: float) -> GEVTail:
-    """Solve for (ξ, μ, σ) matching three conditions at the anchor."""
-    # Initial guess: Gumbel (ξ=0) with σ such that the PDF roughly matches.
-    # For Gumbel at z=0: PDF = e^(-1)/σ, so σ ≈ e^(-1)/q_anchor.
-    sigma0 = max(np.exp(-1) / max(anchor_q, 1e-8), 1.0)
-    mu0 = anchor_K - (np.log(-np.log(max(anchor_cdf, 1e-6))) * sigma0
-                       if side == "right" else -sigma0)
-    xi0 = 0.15 if side == "left" else 0.05
+# ── Anchor measurements ─────────────────────────────────────────────────
+
+def _local_log_slope(strikes: np.ndarray, q: np.ndarray, idx: int) -> float:
+    """d log q / dK at index idx, averaged over a small neighbourhood."""
+    if idx <= 1 or idx >= len(q) - 2:
+        return 0.0
+    i_lo, i_hi = max(0, idx - 2), min(len(q) - 1, idx + 2)
+    qs = q[i_lo:i_hi + 1]
+    ks = strikes[i_lo:i_hi + 1]
+    mask = qs > 0
+    if mask.sum() < 2:
+        return 0.0
+    log_q = np.log(qs[mask])
+    return float(np.polyfit(ks[mask], log_q, 1)[0])
+
+
+# ── GEV fitting (per side) ──────────────────────────────────────────────
+
+_GEV_LOSS_REJECT = 0.5
+_PDF_ERR_REJECT = 0.20
+
+
+def _fit_gev_one_side(side: str, anchor_K: float, anchor_q: float,
+                       anchor_cdf: float, slope_log_q: float,
+                       K_lo: float, K_hi: float) -> Optional[GEVTail]:
+    """Solve 3-target GEV calibration. None if numerically poor."""
+    width = max(K_hi - K_lo, 1.0)
+
+    if side == "right":
+        target_pdf = anchor_q
+        target_cdf = anchor_cdf
+        target_slope = slope_log_q
+    elif side == "left":
+        target_pdf = anchor_q
+        target_cdf = 1.0 - anchor_cdf
+        target_slope = -slope_log_q
+    else:
+        raise ValueError(side)
+
+    sigma0 = max(width * 0.10, 1.0)
+    if 1e-6 < target_cdf < 1 - 1e-6:
+        mu0 = anchor_K - sigma0 * (-np.log(-np.log(target_cdf)))
+    else:
+        mu0 = anchor_K
+    xi0 = 0.1 if side == "left" else 0.05
 
     def objective(theta):
         xi, mu, sigma = theta
-        if sigma <= 0:
+        if sigma <= 1e-4 or abs(xi) > 0.8:
             return 1e6
-        # PDF match at anchor
-        f = _gev_pdf(np.array([anchor_K]), xi, mu, sigma)[0]
-        # CDF match at anchor (for right tail we match 1-CDF since we're
-        # in the upper tail above the anchor)
-        F = _gev_cdf(np.array([anchor_K]), xi, mu, sigma)[0]
-        if side == "right":
-            F_target = anchor_cdf
-        else:
-            F_target = anchor_cdf
-        # Local-slope match (log derivative).
-        h = (K_hi - K_lo) * 0.001
-        f_plus = _gev_pdf(np.array([anchor_K + h]), xi, mu, sigma)[0]
-        f_minus = _gev_pdf(np.array([anchor_K - h]), xi, mu, sigma)[0]
-        if f > 1e-12 and f_plus > 0 and f_minus > 0:
-            slope_pred = (np.log(f_plus) - np.log(f_minus)) / (2 * h)
-        else:
-            slope_pred = 0.0
-        return ((f - anchor_q) ** 2 / max(anchor_q ** 2, 1e-12)
-                + (F - F_target) ** 2
-                + ((slope_pred - q_slope) / max(abs(q_slope), 1.0)) ** 2)
+        f = float(_gev_pdf(np.array([anchor_K]), xi, mu, sigma)[0])
+        if f <= 0 or not np.isfinite(f):
+            return 1e6
+        F = float(_gev_cdf(np.array([anchor_K]), xi, mu, sigma)[0])
+        if not np.isfinite(F):
+            return 1e6
+        h = max(width * 0.001, 0.05)
+        f_p = float(_gev_pdf(np.array([anchor_K + h]), xi, mu, sigma)[0])
+        f_m = float(_gev_pdf(np.array([anchor_K - h]), xi, mu, sigma)[0])
+        if f_p <= 0 or f_m <= 0:
+            return 1e6
+        slope_pred = (np.log(f_p) - np.log(f_m)) / (2 * h)
+        e_pdf = ((f - target_pdf) / max(abs(target_pdf), 1e-12)) ** 2
+        cdf_scale = max(target_cdf * (1 - target_cdf), 1e-3)
+        e_cdf = ((F - target_cdf) ** 2) / cdf_scale
+        slope_scale = max(abs(target_slope), 1e-3)
+        e_slope = ((slope_pred - target_slope) / slope_scale) ** 2
+        return e_pdf + 0.5 * e_cdf + 0.5 * e_slope
 
-    bounds = [(-0.5, 0.8), (K_lo - 10 * (K_hi - K_lo), K_hi + 10 * (K_hi - K_lo)),
-              (max((K_hi - K_lo) * 0.001, 0.1), (K_hi - K_lo) * 10)]
     result = minimize(objective, [xi0, mu0, sigma0],
-                      method="Nelder-Mead",
-                      options={"maxiter": 1000, "xatol": 1e-6})
-
+                       method="Nelder-Mead",
+                       options={"maxiter": 2000, "xatol": 1e-6,
+                                "fatol": 1e-8, "adaptive": True})
     xi, mu, sigma = result.x
-    return GEVTail(side=side, xi=xi, mu=mu, sigma=sigma,
-                    anchor_K=anchor_K, anchor_q=anchor_q)
+    if not result.success or result.fun > _GEV_LOSS_REJECT:
+        return None
+    f_final = float(_gev_pdf(np.array([anchor_K]), xi, mu, sigma)[0])
+    if f_final <= 0 or abs(f_final - target_pdf) / max(target_pdf, 1e-12) > _PDF_ERR_REJECT:
+        return None
+    return GEVTail(side=side, xi=float(xi), mu=float(mu), sigma=float(sigma),
+                    anchor_K=anchor_K, anchor_q=anchor_q,
+                    fit_loss=float(result.fun), converged=True)
 
 
-@dataclass(frozen=True)
-class ExpTail:
-    """One-sided exponential-decay tail. q(K) = anchor_q · exp(-|K-anchor|/lam)."""
-    side: str
-    anchor_K: float
-    anchor_q: float
-    lam: float           # decay length scale (in strike units)
+# ── Exponential-decay fallback ──────────────────────────────────────────
+
+def _exp_tail_lambda(slope_log_q: float) -> float:
+    if not np.isfinite(slope_log_q) or slope_log_q == 0:
+        return 5.0
+    return float(np.clip(abs(1.0 / slope_log_q), 0.5, 100.0))
 
 
-def _exp_tail_lambda(anchor_q: float, slope_log_q: float, side: str) -> float:
-    """Choose λ so that the exponential's log-slope matches the BL log-slope
-    at the anchor.
+# ── Tail PDF evaluator ──────────────────────────────────────────────────
 
-    For q(K) = anchor_q · exp(-(K - anchor)/λ) on the right wing,
-        d/dK ln q = -1/λ
-    so λ = -1 / slope_log_q  on the right (slope_log_q < 0 expected).
-    On the left we use q(K) = anchor_q · exp(-(anchor - K)/λ), so
-        d/dK ln q = +1/λ  →  λ = +1/slope_log_q  on the left (slope > 0).
-    Default λ when the anchor slope is ~0: 5% of strike (sensible scale).
-    """
-    if slope_log_q == 0 or not np.isfinite(slope_log_q):
-        return max(anchor_q * 0.0 + 5.0, 1.0)  # ~$5 default scale
-    inv = abs(1.0 / slope_log_q)
-    return float(np.clip(inv, 0.5, 100.0))
+def _tail_pdf_at(K: np.ndarray, tail: Tail) -> np.ndarray:
+    """Evaluate the tail PDF at strikes K (must be on the correct side)."""
+    if isinstance(tail, GEVTail):
+        if tail.side == "right":
+            return _gev_pdf(K, tail.xi, tail.mu, tail.sigma)
+        # Left tail: reflect K through anchor before evaluating GEV
+        K_refl = 2 * tail.anchor_K - K
+        return _gev_pdf(K_refl, tail.xi, tail.mu, tail.sigma)
+    # ExpTail
+    if tail.side == "right":
+        return tail.anchor_q * np.exp(-(K - tail.anchor_K) / tail.lam)
+    return tail.anchor_q * np.exp(-(tail.anchor_K - K) / tail.lam)
 
+
+# ── Public entry ────────────────────────────────────────────────────────
 
 def attach_tails(strikes_inner: np.ndarray, q_inner: np.ndarray,
                   cdf_inner: np.ndarray,
                   *, left_quantile: float = 0.05,
                   right_quantile: float = 0.95,
                   extension_factor: float = 3.0,
-                  grid_density: int = 200):
-    """Attach exponential-decay tails to a BL density and renormalise.
-
-    Returns:
-        K_full         strike grid spanning  K_lo - (ext-1)·width ... K_hi + (ext-1)·width
-        q_full         stitched, renormalised density (integrates to 1)
-        left_tail      ExpTail diagnostic dataclass
-        right_tail     ExpTail diagnostic dataclass
-    """
+                  grid_density: int = 200
+                  ) -> Tuple[np.ndarray, np.ndarray, Tail, Tail]:
+    """Attach GEV (with exp fallback) tails to a BL density and renormalise."""
     K_lo, K_hi = float(strikes_inner.min()), float(strikes_inner.max())
     width = K_hi - K_lo
 
@@ -180,25 +228,30 @@ def attach_tails(strikes_inner: np.ndarray, q_inner: np.ndarray,
     anchor_K_R = float(strikes_inner[idx_R])
     anchor_q_L = max(float(q_inner[idx_L]), 1e-12)
     anchor_q_R = max(float(q_inner[idx_R]), 1e-12)
+    anchor_cdf_L = float(cdf_inner[idx_L])
+    anchor_cdf_R = float(cdf_inner[idx_R])
+    slope_L = _local_log_slope(strikes_inner, q_inner, idx_L)
+    slope_R = _local_log_slope(strikes_inner, q_inner, idx_R)
 
-    def _local_slope(idx: int) -> float:
-        if idx <= 0 or idx >= len(q_inner) - 1:
-            return 0.0
-        if q_inner[idx - 1] <= 0 or q_inner[idx + 1] <= 0:
-            return 0.0
-        return (np.log(q_inner[idx + 1]) - np.log(q_inner[idx - 1])) / (
-            strikes_inner[idx + 1] - strikes_inner[idx - 1])
+    left_gev = _fit_gev_one_side(
+        "left", anchor_K_L, anchor_q_L, anchor_cdf_L, slope_L, K_lo, K_hi)
+    if left_gev is not None:
+        left_tail: Tail = left_gev
+    else:
+        left_tail = ExpTail(side="left", anchor_K=anchor_K_L,
+                             anchor_q=anchor_q_L,
+                             lam=_exp_tail_lambda(slope_L),
+                             reason="gev_fit_failed")
 
-    slope_L = _local_slope(idx_L)
-    slope_R = _local_slope(idx_R)
-
-    lam_L = _exp_tail_lambda(anchor_q_L, slope_L, side="left")
-    lam_R = _exp_tail_lambda(anchor_q_R, slope_R, side="right")
-
-    left_tail = ExpTail(side="left", anchor_K=anchor_K_L,
-                         anchor_q=anchor_q_L, lam=lam_L)
-    right_tail = ExpTail(side="right", anchor_K=anchor_K_R,
-                          anchor_q=anchor_q_R, lam=lam_R)
+    right_gev = _fit_gev_one_side(
+        "right", anchor_K_R, anchor_q_R, anchor_cdf_R, slope_R, K_lo, K_hi)
+    if right_gev is not None:
+        right_tail: Tail = right_gev
+    else:
+        right_tail = ExpTail(side="right", anchor_K=anchor_K_R,
+                              anchor_q=anchor_q_R,
+                              lam=_exp_tail_lambda(slope_R),
+                              reason="gev_fit_failed")
 
     K_min_ext = max(0.01, K_lo - width * (extension_factor - 1.0))
     K_max_ext = K_hi + width * (extension_factor - 1.0)
@@ -211,14 +264,13 @@ def attach_tails(strikes_inner: np.ndarray, q_inner: np.ndarray,
                                          strikes_inner, q_inner)
     left_mask = K_full < anchor_K_L
     if left_mask.any():
-        q_full[left_mask] = anchor_q_L * np.exp(
-            -(anchor_K_L - K_full[left_mask]) / lam_L)
+        q_full[left_mask] = _tail_pdf_at(K_full[left_mask], left_tail)
     right_mask = K_full > anchor_K_R
     if right_mask.any():
-        q_full[right_mask] = anchor_q_R * np.exp(
-            -(K_full[right_mask] - anchor_K_R) / lam_R)
+        q_full[right_mask] = _tail_pdf_at(K_full[right_mask], right_tail)
 
-    total = float(np.trapz(q_full, K_full))
+    trapezoid = getattr(np, "trapezoid", np.trapz)
+    total = float(trapezoid(q_full, K_full))
     if total > 0:
         q_full = q_full / total
 

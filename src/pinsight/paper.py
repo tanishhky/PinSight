@@ -2,22 +2,36 @@
 
 Strategy v0 — **edge_buyer**:
   Entry: open long positions in contracts where
-      edge_ratio < entry_edge_max   (market is cheap vs fair)
-      prob_itm   >= entry_prob_min  (avoid lottery tickets we'll never realise)
-      time_to_expiry >= min_hours_before_open  (avoid last-minute gamma)
-      mid >= min_mid                (avoid penny-noise)
+      market_premium + fill_slippage < fair_premium - per_share_costs
+      (i.e., post-cost expected_pnl > 0)
+      AND  edge_ratio < entry_edge_max  (market < fair before cost)
+      AND  prob_itm   >= entry_prob_min  (avoid lottery tickets)
+      AND  time_to_expiry >= min_hours_before_open
+      AND  mid >= min_mid
+  Fill price: mid + slippage_frac_of_half_spread × (ask − mid)
   Sizing: fixed dollar per position (per_position_cap), bankroll
       cap (aggregate_cap_pct).
   Exit: HOLD TO CLOSE.
-      At resolution: realize intrinsic value at the underlying close.
-      No intraday TP / SL — per the user's "measure raw signal edge" choice.
-  Force-exit: if a position can't find a closing snapshot at expiry, mark
-      it `failed_close` so it doesn't sit `open` forever.
+      At resolution: realize intrinsic value at the underlying close;
+      pay exit commission.
+  Force-exit: position past expiry without closing snapshot → marked
+      `closed_failed_close`.
 
-No-lookahead discipline (per ADR 0004):
+Transaction costs (institutional-desk profile, locked 2026-06-03):
+  commission_per_contract      = $0.35 each leg
+  slippage_frac_of_half_spread = 0.25 (close to mid)
+  fees_per_contract            = $0.00 (assumed passthrough)
+
+MTM (dual):
+  Each tick computes both
+    mtm_fair_usd  = (fair_premium_now − entry_fill_price) × 100 × n
+    mtm_market_usd = (chain_mid_now      − entry_fill_price) × 100 × n
+  Stored in equity_history with drawdown computed from mtm_market.
+
+No-lookahead discipline (per ADR-0004):
   Every chain read passes `as_of_ts` and the orchestrator asserts
-  `snapshot_ts <= as_of_ts`. All decisions are stamped with `as_of_ts`,
-  never `datetime.now()`.
+  `snapshot_ts <= as_of_ts` via parsed-datetime comparison. All
+  decisions stamped with `as_of_ts`, never `datetime.now()`.
 """
 
 from __future__ import annotations
@@ -36,19 +50,33 @@ from .rnd.density import RNDFit, extract
 
 
 TRADER_ID = "edge_buyer"
-DEFAULT_BANKROLL = 50_000.0  # user-locked 2026-06-01
+DEFAULT_BANKROLL = 50_000.0
+
+
+# ── ISO 8601 parsing (shared with RND module) ───────────────────────────
+
+def _parse_iso(ts: str) -> datetime:
+    s = str(ts).replace("Z", "+00:00")
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 @dataclass(frozen=True)
 class EntryRule:
     """Tunable knobs for the edge_buyer agent."""
-    entry_edge_max: float = 0.85       # buy if market < 85 % of fair
-    entry_prob_min: float = 0.20       # skip if P(ITM) < 20 %
-    min_hours_before_open: float = 1.0  # avoid sub-hour gamma chaos
-    min_mid: float = 0.05               # penny-noise floor
-    per_position_cap_pct: float = 0.02  # 2 % of bankroll per contract
-    aggregate_cap_pct: float = 0.50     # 50 % across all open positions
-    min_position_usd: float = 50.0      # fees + slippage floor
+    entry_edge_max: float = 0.85
+    entry_prob_min: float = 0.20
+    min_hours_before_open: float = 1.0
+    min_mid: float = 0.05
+    per_position_cap_pct: float = 0.02
+    aggregate_cap_pct: float = 0.50
+    min_position_usd: float = 50.0
+    # Transaction costs (institutional desk)
+    commission_per_contract: float = 0.35
+    slippage_frac_of_half_spread: float = 0.25
+    fees_per_contract: float = 0.0
 
 
 # ── Persistence paths ────────────────────────────────────────────────────
@@ -72,7 +100,7 @@ class TraderState:
     trader: str
     bankroll_init: float
     cash_usd: float
-    open_exposure: float
+    open_exposure: float    # USD cost basis (entry_fill_price × 100 × n) of open positions
     closed_pnl: float
 
     @property
@@ -100,22 +128,25 @@ def _load_or_init_state(data_dir: Path,
                        closed_pnl=0.0)
 
 
-def _save_state(data_dir: Path, state: TraderState) -> None:
+def _save_state(data_dir: Path, state: TraderState,
+                 peak_market_equity: float,
+                 current_market_equity: float) -> None:
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     p = _state_path(data_dir)
     existing = pd.read_parquet(p) if p.exists() else pd.DataFrame()
     if not existing.empty:
         existing = existing[existing["trader"] != TRADER_ID]
-    peak = max(state.bankroll_init + state.closed_pnl,
-                state.total_equity_cost_basis)
-    dd_pct = (peak - state.total_equity_cost_basis) / peak * 100.0 if peak > 0 else 0.0
+    dd_pct = ((peak_market_equity - current_market_equity)
+              / peak_market_equity * 100.0
+              if peak_market_equity > 0 else 0.0)
     new_row = pd.DataFrame([{
         "trader": TRADER_ID,
         "bankroll_init": state.bankroll_init,
         "cash_usd": state.cash_usd,
         "open_exposure": state.open_exposure,
         "closed_pnl": state.closed_pnl,
-        "peak_equity": peak,
+        "peak_equity": peak_market_equity,
+        "current_market_equity": current_market_equity,
         "current_drawdown_pct": round(dd_pct, 3),
         "updated_ts": now,
     }])
@@ -149,11 +180,33 @@ def _save_positions(data_dir: Path, opened: list[dict],
     df.to_parquet(p, compression="snappy", index=False)
 
 
+# ── Cost helpers ────────────────────────────────────────────────────────
+
+def _entry_fill_price(mid: float, ask: float, bid: float,
+                       slip_frac: float) -> float:
+    """Long buy: pay mid + slippage_frac × (ask - mid). slip_frac=0 → mid,
+    slip_frac=1 → ask. Bounded above by ask."""
+    half_spread = max(ask - mid, 0.0)
+    return float(min(ask, mid + slip_frac * half_spread))
+
+
+def _exit_fill_price_market(market_mid: float, market_bid: float,
+                              slip_frac: float) -> float:
+    """Long sell at exit: receive mid - slippage_frac × (mid - bid).
+    Bounded below by bid."""
+    half_spread = max(market_mid - market_bid, 0.0)
+    return float(max(market_bid, market_mid - slip_frac * half_spread))
+
+
 def _open_position(spec: ContractSpec, fv: FairValue, *,
                     as_of_ts: str, n_contracts: int,
-                    spot_at_entry: float, rnd_T: float) -> dict:
-    # Premium per share of underlying (×100 multiplier per contract)
-    entry_size_usd = spec.market_premium * 100 * n_contracts
+                    spot_at_entry: float, rnd_T: float,
+                    entry_fill_price: float, ask: float, bid: float,
+                    commission_paid: float,
+                    fees_paid: float) -> dict:
+    """A position record. cost basis = (fill × 100 × n) + commission + fees."""
+    notional = entry_fill_price * 100 * n_contracts
+    total_cost = notional + commission_paid + fees_paid
     return {
         "trade_id": str(uuid.uuid4()),
         "trader": TRADER_ID,
@@ -162,18 +215,27 @@ def _open_position(spec: ContractSpec, fv: FairValue, *,
         "strike": float(spec.strike),
         "expiry": spec.expiry,
         "entry_ts": as_of_ts,
-        "entry_price": float(spec.market_premium),
-        "entry_size_usd": float(entry_size_usd),
+        "entry_mid": float(spec.market_premium),
+        "entry_ask": float(ask),
+        "entry_bid": float(bid),
+        "entry_fill_price": float(entry_fill_price),
+        "entry_notional_usd": float(notional),
+        "entry_commission_usd": float(commission_paid),
+        "entry_fees_usd": float(fees_paid),
+        "entry_total_cost_usd": float(total_cost),
         "n_contracts": int(n_contracts),
         "spot_at_entry": float(spot_at_entry),
         "T_at_entry_hours": float(rnd_T * 8760),
         "fair_at_entry": float(fv.fair_premium),
         "edge_at_entry": float(fv.edge_ratio),
         "prob_itm_at_entry": float(fv.prob_itm),
-        "expected_pnl_at_entry": float(fv.expected_pnl),
+        "expected_pnl_at_entry_gross": float(fv.expected_pnl),
         "status": "open",
         "exit_ts": None,
         "exit_price": None,
+        "exit_proceeds_usd": None,
+        "exit_commission_usd": None,
+        "exit_fees_usd": None,
         "exit_reason": None,
         "spot_at_exit": None,
         "pnl_usd": None,
@@ -187,23 +249,147 @@ def _intrinsic(kind: str, strike: float, spot: float) -> float:
     return max(strike - spot, 0.0)
 
 
-def _close_position(pos: dict, *, as_of_ts: str, exit_spot: float,
-                     reason: str) -> dict:
+def _settlement_spot(data_dir: Path, symbol: str, expiry_iso: str,
+                       expiry_dt: datetime) -> Optional[float]:
+    """Return the underlying close price for `expiry_iso` from the stored
+    chain parquet, picking the snapshot at-or-after the expiry time. Falls
+    back to the latest pre-expiry snapshot if no post-expiry snapshot was
+    captured. Returns None if the chain file is missing or empty.
+
+    Used by the per-position expiry-close path so positions from a prior
+    day's expiry close at THAT day's settlement spot, not today's.
+    (Bug 2 fix 2026-06-10.)
+    """
+    chain_path = data_dir / "chains" / symbol / f"{expiry_iso}.parquet"
+    if not chain_path.exists():
+        return None
+    try:
+        df = pd.read_parquet(chain_path)
+    except Exception:
+        return None
+    if df.empty or "_snapshot_ts" not in df.columns:
+        return None
+    snap_dt = df["_snapshot_ts"].map(_parse_iso)
+    post = df[snap_dt >= expiry_dt]
+    if not post.empty:
+        # Prefer the earliest at-or-after-expiry snapshot (true settlement).
+        idx = snap_dt[snap_dt >= expiry_dt].idxmin()
+        return float(df.loc[idx, "underlying_price"])
+    # Fallback: most recent pre-expiry snapshot.
+    pre = df[snap_dt < expiry_dt]
+    if pre.empty:
+        return None
+    idx = snap_dt[snap_dt < expiry_dt].idxmax()
+    return float(df.loc[idx, "underlying_price"])
+
+
+def _close_position_at_expiry(pos: dict, *, as_of_ts: str, exit_spot: float,
+                                rule: EntryRule) -> dict:
+    """HOLD-TO-CLOSE settlement: payoff = intrinsic per share × 100 × n.
+    Exit commission applies (settlement also costs at most institutional
+    desks; if pos goes worthless, no exit commission per most broker
+    contracts — we model it conservatively as charged regardless)."""
+    n = int(pos["n_contracts"])
     intrinsic = _intrinsic(pos["kind"], pos["strike"], exit_spot)
-    pnl_per_share = intrinsic - pos["entry_price"]
-    pnl_per_contract = pnl_per_share * 100
-    pnl_usd = pnl_per_contract * pos["n_contracts"]
+    proceeds = intrinsic * 100 * n
+    exit_commission = rule.commission_per_contract * n if intrinsic > 0 else 0.0
+    exit_fees = rule.fees_per_contract * n if intrinsic > 0 else 0.0
+    net_proceeds = proceeds - exit_commission - exit_fees
+    pnl_usd = net_proceeds - pos["entry_total_cost_usd"]
+    pnl_per_contract = pnl_usd / n if n else 0.0
     closed = dict(pos)
     closed.update({
         "exit_ts": as_of_ts,
         "exit_price": float(intrinsic),
-        "exit_reason": reason,
+        "exit_proceeds_usd": float(proceeds),
+        "exit_commission_usd": float(exit_commission),
+        "exit_fees_usd": float(exit_fees),
+        "exit_reason": "expiry",
         "spot_at_exit": float(exit_spot),
         "pnl_usd": float(pnl_usd),
         "pnl_per_contract": float(pnl_per_contract),
-        "status": f"closed_{reason}",
+        "status": "closed_expiry",
     })
     return closed
+
+
+# ── MTM helpers ──────────────────────────────────────────────────────────
+
+def _mtm_market_mid(chain_df: pd.DataFrame, kind: str,
+                     strike: float) -> Optional[float]:
+    """Find the current mid for a (kind, strike) in the latest chain
+    snapshot. Returns None if not present."""
+    row = chain_df[(chain_df["contract_type"] == kind)
+                   & (chain_df["strike"] == strike)]
+    if row.empty:
+        return None
+    r = row.iloc[0]
+    bid = float(r.get("bid", 0) or 0)
+    ask = float(r.get("ask", 0) or 0)
+    if bid <= 0 or ask <= 0:
+        m = r.get("mid")
+        return float(m) if m is not None and not pd.isna(m) else None
+    return float((bid + ask) / 2.0)
+
+
+def _mtm_for_open_positions(open_positions: list[dict],
+                              rnd: Optional[RNDFit],
+                              chain_df: pd.DataFrame,
+                              expiry_iso: str) -> list[dict]:
+    """For each open position, compute both mtm_fair and mtm_market.
+
+    Returns a list of dicts (one per position) with the per-position MTM
+    info, for storage in equity_history details.
+    """
+    rows = []
+    for pos in open_positions:
+        n = int(pos["n_contracts"])
+        fill = float(pos["entry_fill_price"])
+        kind = pos["kind"]
+        strike = float(pos["strike"])
+        cost = float(pos["entry_total_cost_usd"])
+        # Fair value via RND
+        if rnd is not None:
+            fv = price_contract(rnd, ContractSpec(
+                kind=kind, strike=strike,
+                market_premium=fill,  # market_premium placeholder; we only need fair
+                ticker=pos.get("ticker"),
+                expiry=pos.get("expiry"),
+            ))
+            mtm_fair_per_share = fv.fair_premium - fill
+            mtm_fair_usd = mtm_fair_per_share * 100 * n
+            current_fair_value_usd = fv.fair_premium * 100 * n
+        else:
+            mtm_fair_per_share = float("nan")
+            mtm_fair_usd = float("nan")
+            current_fair_value_usd = float("nan")
+        # Market mid
+        market_mid = _mtm_market_mid(chain_df, kind, strike)
+        if market_mid is not None:
+            mtm_market_per_share = market_mid - fill
+            mtm_market_usd = mtm_market_per_share * 100 * n
+            current_market_value_usd = market_mid * 100 * n
+        else:
+            mtm_market_per_share = float("nan")
+            mtm_market_usd = float("nan")
+            current_market_value_usd = cost   # no quote → fall back to cost basis
+        rows.append({
+            "trade_id": pos["trade_id"],
+            "kind": kind,
+            "strike": strike,
+            "n_contracts": n,
+            "entry_fill_price": fill,
+            "current_fair_price": current_fair_value_usd / (100 * n) if n else float("nan"),
+            "current_market_mid": market_mid if market_mid is not None else float("nan"),
+            "mtm_fair_per_share": mtm_fair_per_share,
+            "mtm_market_per_share": mtm_market_per_share,
+            "mtm_fair_usd": mtm_fair_usd,
+            "mtm_market_usd": mtm_market_usd,
+            "current_fair_value_usd": current_fair_value_usd,
+            "current_market_value_usd": current_market_value_usd,
+            "entry_cost_usd": cost,
+        })
+    return rows
 
 
 # ── Tick driver ──────────────────────────────────────────────────────────
@@ -213,19 +399,7 @@ def tick(data_dir: Path, chain_df: pd.DataFrame, *,
          expiry_iso: Optional[str] = None,
          rule: Optional[EntryRule] = None,
          bankroll: float = DEFAULT_BANKROLL) -> dict:
-    """One paper-tick for the edge_buyer.
-
-    Steps:
-      1. If `expiry_iso` is None, infer from chain (single-expiry chain
-         file at data/chains/SYM/<expiry>.parquet).
-      2. If any currently-open positions are AT or PAST expiry, close
-         them at the underlying close at expiry.
-      3. Fit RND from the latest snapshot in `chain_df` ≤ as_of_ts.
-      4. Score every contract in the chain → pick BUY candidates.
-      5. Open up to the cap.
-
-    Returns a per-tick summary dict.
-    """
+    """One paper-tick for the edge_buyer."""
     if rule is None:
         rule = EntryRule()
     if as_of_ts is None:
@@ -233,12 +407,16 @@ def tick(data_dir: Path, chain_df: pd.DataFrame, *,
     if chain_df is None or chain_df.empty:
         return {"as_of_ts": as_of_ts, "skipped": "no_chain"}
 
-    # Filter to snapshots within our as-of horizon — no lookahead.
+    # ── No-lookahead filter (parsed-datetime, not string) ──
+    as_of_dt = _parse_iso(as_of_ts)
     if "_snapshot_ts" in chain_df.columns:
-        chain_df = chain_df[chain_df["_snapshot_ts"] <= as_of_ts]
+        snap_dt = chain_df["_snapshot_ts"].map(_parse_iso)
+        chain_df = chain_df[snap_dt <= as_of_dt]
         if chain_df.empty:
             return {"as_of_ts": as_of_ts, "skipped": "no_eligible_snapshots"}
-        latest_snap = chain_df["_snapshot_ts"].max()
+        snap_dt = chain_df["_snapshot_ts"].map(_parse_iso)
+        latest_idx = snap_dt.idxmax()
+        latest_snap = chain_df.loc[latest_idx, "_snapshot_ts"]
         chain_df = chain_df[chain_df["_snapshot_ts"] == latest_snap]
 
     if expiry_iso is None:
@@ -251,126 +429,230 @@ def tick(data_dir: Path, chain_df: pd.DataFrame, *,
     state = _load_or_init_state(data_dir, bankroll=bankroll)
 
     # ── Close any positions whose expiry has passed ──
+    # Per-position expiry handling (Bug 2 fix 2026-06-10): each position's
+    # own `expiry` field is the gate, not the current chain's expiry. A
+    # position opened against an earlier expiry must still be closed when
+    # `now_dt >= position.expiry`, regardless of which expiry the current
+    # chain is for. Settlement spot is sourced from the stored chain
+    # parquet for that expiry, not from the current chain.
     positions = _load_positions(data_dir)
     open_positions = [p for p in positions
                       if p.get("trader") == TRADER_ID
                       and p.get("status") == "open"]
-    expiry_dt = datetime.fromisoformat(expiry_iso + "T20:00:00+00:00") \
-        if "T" not in expiry_iso else datetime.fromisoformat(expiry_iso.replace("Z", "+00:00"))
-    now_dt = datetime.fromisoformat(as_of_ts.replace("Z", "+00:00"))
+    now_dt = _parse_iso(as_of_ts)
     closed: list[dict] = []
-    if now_dt >= expiry_dt and open_positions:
-        # All open positions reach expiry → close at current spot.
-        for pos in open_positions:
-            closed_pos = _close_position(pos, as_of_ts=as_of_ts,
-                                          exit_spot=spot, reason="expiry")
+
+    # Group open positions by stored expiry, then settle each expired group.
+    by_expiry: dict[str, list[dict]] = {}
+    for p in open_positions:
+        exp = str(p.get("expiry") or "")
+        if exp:
+            by_expiry.setdefault(exp, []).append(p)
+
+    underlying_symbol = str(
+        chain_df["underlying"].iloc[0] if "underlying" in chain_df.columns else "SPY"
+    ).upper()
+
+    survivors: list[dict] = []
+    for pos_expiry, pos_list in by_expiry.items():
+        group_expiry_dt = (_parse_iso(pos_expiry + "T20:00:00+00:00")
+                            if "T" not in pos_expiry
+                            else _parse_iso(pos_expiry))
+        if now_dt < group_expiry_dt:
+            survivors.extend(pos_list)
+            continue
+
+        # Past expiry — find a settlement spot from the stored chain for
+        # THIS expiry, not the current chain.
+        if pos_expiry == expiry_iso:
+            settlement_spot = spot
+        else:
+            settlement_spot = _settlement_spot(
+                data_dir, underlying_symbol, pos_expiry, group_expiry_dt)
+        if settlement_spot is None:
+            obs.event(channel="error", kind="paper.settlement_spot_missing",
+                      level="WARNING", as_of_ts=as_of_ts,
+                      expiry=pos_expiry, symbol=underlying_symbol,
+                      n_unsettled=len(pos_list))
+            survivors.extend(pos_list)
+            continue
+
+        for pos in pos_list:
+            closed_pos = _close_position_at_expiry(
+                pos, as_of_ts=as_of_ts, exit_spot=settlement_spot, rule=rule)
             closed.append(closed_pos)
-            # Cash settles in.
+            net_proceeds = (closed_pos["exit_proceeds_usd"]
+                             - closed_pos["exit_commission_usd"]
+                             - closed_pos["exit_fees_usd"])
+            # Cost basis: prefer the new-schema entry_total_cost_usd;
+            # fall back to legacy entry_size_usd. Defensive against any
+            # pre-2026-06-04 trades that didn't track commissions.
+            cost_basis = pos.get("entry_total_cost_usd")
+            if cost_basis is None or (isinstance(cost_basis, float)
+                                        and pd.isna(cost_basis)):
+                cost_basis = pos.get("entry_size_usd") or 0.0
             state = TraderState(
                 trader=TRADER_ID, bankroll_init=state.bankroll_init,
-                cash_usd=state.cash_usd + pos["entry_size_usd"] + closed_pos["pnl_usd"],
-                open_exposure=state.open_exposure - pos["entry_size_usd"],
+                cash_usd=state.cash_usd + net_proceeds,
+                open_exposure=state.open_exposure - float(cost_basis),
                 closed_pnl=state.closed_pnl + closed_pos["pnl_usd"],
             )
-        open_positions = []
+    open_positions = survivors
 
-    # ── If still in the force-exit window for entries, skip opens ──
+    # Compute hours-to-expiry off the CURRENT chain's expiry (used by the
+    # entry-window guard below). This is the next deadline coming up.
+    expiry_dt = (_parse_iso(expiry_iso + "T20:00:00+00:00")
+                  if "T" not in expiry_iso
+                  else _parse_iso(expiry_iso))
+
+    # ── RND fit (always — used for both entry decisions and MTM) ──
     hours_to_expiry = (expiry_dt - now_dt).total_seconds() / 3600.0
+    rnd: Optional[RNDFit] = None
+    try:
+        rnd = extract(chain_df, spot=spot, as_of_ts=as_of_ts,
+                       expiry_iso=expiry_iso)
+    except Exception as exc:
+        obs.event(channel="error", kind="paper.rnd_fail",
+                  level="WARNING", as_of_ts=as_of_ts, err=str(exc))
+
+    # ── Open new positions if time-window permits ──
     opened: list[dict] = []
     candidates_evaluated = 0
     candidates_buy = 0
-    rnd: Optional[RNDFit] = None
+    if hours_to_expiry >= rule.min_hours_before_open and rnd is not None:
+        held = {(p["kind"], float(p["strike"])) for p in open_positions}
+        per_share_cost_floor = (rule.commission_per_contract +
+                                  rule.fees_per_contract) / 100.0
+        buys: list[tuple[ContractSpec, FairValue, float, float, float]] = []
+        for _, row in chain_df.iterrows():
+            ctype = row["contract_type"]
+            strike = float(row["strike"])
+            bid = float(row.get("bid", 0) or 0)
+            ask = float(row.get("ask", 0) or 0)
+            if bid <= 0 or ask <= 0:
+                continue
+            mid = (bid + ask) / 2.0
+            if mid < rule.min_mid:
+                continue
+            if (ctype, strike) in held:
+                continue
+            candidates_evaluated += 1
+            entry_fill = _entry_fill_price(mid, ask, bid,
+                                             rule.slippage_frac_of_half_spread)
+            spec = ContractSpec(kind=ctype, strike=strike,
+                                 market_premium=mid,
+                                 ticker=row.get("ticker"),
+                                 expiry=expiry_iso)
+            fv = price_contract(rnd, spec)
+            # Pre-cost edge check (a contract must look cheap before
+            # we even think about costs).
+            if not (fv.edge_ratio < rule.entry_edge_max
+                     and fv.prob_itm >= rule.entry_prob_min):
+                continue
+            # Post-cost EV check: fair premium must exceed fill price
+            # PLUS round-trip per-share costs.
+            roundtrip_cost_per_share = 2 * per_share_cost_floor
+            net_edge_per_share = (fv.fair_premium - entry_fill
+                                    - roundtrip_cost_per_share)
+            if net_edge_per_share <= 0:
+                continue
+            buys.append((spec, fv, entry_fill, bid, ask))
 
-    if hours_to_expiry >= rule.min_hours_before_open:
-        # ── Fit RND ──
-        try:
-            rnd = extract(chain_df, spot=spot, as_of_ts=as_of_ts,
-                           expiry_iso=expiry_iso)
-        except Exception as exc:
-            obs.event(channel="error", kind="paper.rnd_fail",
-                      level="WARNING", as_of_ts=as_of_ts, err=str(exc))
-            rnd = None
+        buys.sort(
+            key=lambda x: (x[1].fair_premium - x[2]) * x[1].prob_itm,
+            reverse=True)
+        candidates_buy = len(buys)
 
-        if rnd is not None:
-            # Set of (kind, strike) we already hold so we don't double-up.
-            held = {(p["kind"], float(p["strike"])) for p in open_positions}
-
-            # ── Score every contract; pick BUYs ──
-            buys: list[tuple[ContractSpec, FairValue]] = []
-            for _, row in chain_df.iterrows():
-                ctype = row["contract_type"]
-                strike = float(row["strike"])
-                bid = float(row.get("bid", 0))
-                ask = float(row.get("ask", 0))
-                mid = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else float(row.get("mid", 0))
-                if mid < rule.min_mid or bid <= 0:
-                    continue
-                if (ctype, strike) in held:
-                    continue
-                candidates_evaluated += 1
-                spec = ContractSpec(kind=ctype, strike=strike,
-                                     market_premium=mid,
-                                     ticker=row.get("ticker"),
-                                     expiry=expiry_iso)
-                fv = price_contract(rnd, spec)
-                if (fv.edge_ratio < rule.entry_edge_max
-                        and fv.prob_itm >= rule.entry_prob_min
-                        and fv.expected_pnl > 0):
-                    buys.append((spec, fv))
-
-            # Rank by absolute expected_pnl desc.
-            buys.sort(key=lambda x: x[1].expected_pnl, reverse=True)
-            candidates_buy = len(buys)
-
-            # ── Open top candidates within caps ──
-            per_position_cap_usd = state.bankroll_init * rule.per_position_cap_pct
-            agg_cap_usd = state.bankroll_init * rule.aggregate_cap_pct
-            for spec, fv in buys:
-                available = agg_cap_usd - state.open_exposure
-                if available < rule.min_position_usd:
-                    break
-                budget = min(per_position_cap_usd, available, state.cash_usd)
-                # Contract premium × 100 multiplier = USD per contract.
-                cost_per_contract = spec.market_premium * 100.0
-                if cost_per_contract <= 0:
-                    continue
-                n = int(budget // cost_per_contract)
-                if n <= 0:
-                    continue
-                pos = _open_position(spec, fv, as_of_ts=as_of_ts,
-                                      n_contracts=n, spot_at_entry=spot,
-                                      rnd_T=rnd.T)
-                opened.append(pos)
-                state = TraderState(
-                    trader=TRADER_ID,
-                    bankroll_init=state.bankroll_init,
-                    cash_usd=state.cash_usd - pos["entry_size_usd"],
-                    open_exposure=state.open_exposure + pos["entry_size_usd"],
-                    closed_pnl=state.closed_pnl,
-                )
+        per_position_cap_usd = state.bankroll_init * rule.per_position_cap_pct
+        agg_cap_usd = state.bankroll_init * rule.aggregate_cap_pct
+        for spec, fv, fill, bid, ask in buys:
+            available = agg_cap_usd - state.open_exposure
+            if available < rule.min_position_usd:
+                break
+            budget = min(per_position_cap_usd, available, state.cash_usd)
+            cost_per_contract_with_fees = (fill * 100.0
+                                            + rule.commission_per_contract
+                                            + rule.fees_per_contract)
+            if cost_per_contract_with_fees <= 0:
+                continue
+            n = int(budget // cost_per_contract_with_fees)
+            if n <= 0:
+                continue
+            commission_paid = rule.commission_per_contract * n
+            fees_paid = rule.fees_per_contract * n
+            pos = _open_position(spec, fv, as_of_ts=as_of_ts,
+                                  n_contracts=n, spot_at_entry=spot,
+                                  rnd_T=rnd.T, entry_fill_price=fill,
+                                  ask=ask, bid=bid,
+                                  commission_paid=commission_paid,
+                                  fees_paid=fees_paid)
+            opened.append(pos)
+            total_cost = float(pos["entry_total_cost_usd"])
+            state = TraderState(
+                trader=TRADER_ID,
+                bankroll_init=state.bankroll_init,
+                cash_usd=state.cash_usd - total_cost,
+                open_exposure=state.open_exposure + total_cost,
+                closed_pnl=state.closed_pnl,
+            )
 
     # Persist trades + state.
     if opened or closed:
         _save_positions(data_dir, opened=opened, closed=closed)
-    _save_state(data_dir, state)
 
-    # Equity-history row (cost-basis equity; MTM extension is in a
-    # follow-up since options pricing for MTM requires re-fitting the
-    # smile each tick).
+    # ── Dual MTM for open positions ──
+    open_after = [p for p in _load_positions(data_dir)
+                   if p.get("trader") == TRADER_ID
+                   and p.get("status") == "open"]
+    mtm_rows = _mtm_for_open_positions(open_after, rnd, chain_df, expiry_iso)
+    sum_mtm_fair_usd = sum(r["mtm_fair_usd"] for r in mtm_rows
+                            if r["mtm_fair_usd"] == r["mtm_fair_usd"])  # filter NaN
+    sum_mtm_market_usd = sum(r["mtm_market_usd"] for r in mtm_rows
+                              if r["mtm_market_usd"] == r["mtm_market_usd"])
+    sum_current_market_value = sum(r["current_market_value_usd"] for r in mtm_rows)
+    sum_current_fair_value = sum(r["current_fair_value_usd"] for r in mtm_rows
+                                   if r["current_fair_value_usd"]
+                                      == r["current_fair_value_usd"])
+
+    # Equity (market basis): cash + sum(current_market_value)
+    current_market_equity = state.cash_usd + sum_current_market_value
+    current_fair_equity = state.cash_usd + (sum_current_fair_value
+                                              if sum_current_fair_value
+                                              == sum_current_fair_value
+                                              else sum_current_market_value)
+
+    # Update peak (market-basis) — read from existing equity_history
     eq_path = _equity_path(data_dir)
+    if eq_path.exists():
+        prev_eq = pd.read_parquet(eq_path)
+        prev_peak = float(prev_eq["peak_market_equity_usd"].max()
+                           if "peak_market_equity_usd" in prev_eq.columns
+                           and not prev_eq.empty
+                           else state.bankroll_init)
+    else:
+        prev_peak = state.bankroll_init
+    peak_market_equity = max(prev_peak, current_market_equity)
+    drawdown_pct = ((peak_market_equity - current_market_equity)
+                    / peak_market_equity * 100.0
+                    if peak_market_equity > 0 else 0.0)
+
+    _save_state(data_dir, state, peak_market_equity, current_market_equity)
+
     eq_row = pd.DataFrame([{
         "ts": as_of_ts,
         "trader": TRADER_ID,
         "cash_usd": state.cash_usd,
-        "open_exposure_usd": state.open_exposure,
-        "mtm_unrealized_usd": 0.0,   # cost-basis only for v0
+        "open_exposure_cost_basis_usd": state.open_exposure,
+        "open_positions": len(open_after),
+        "sum_mtm_fair_usd": float(sum_mtm_fair_usd) if mtm_rows else 0.0,
+        "sum_mtm_market_usd": float(sum_mtm_market_usd) if mtm_rows else 0.0,
+        "sum_current_fair_value_usd": float(sum_current_fair_value) if mtm_rows else 0.0,
+        "sum_current_market_value_usd": float(sum_current_market_value) if mtm_rows else 0.0,
         "closed_pnl_usd": state.closed_pnl,
-        "total_equity_usd": state.cash_usd + state.open_exposure,
-        "peak_equity_usd": max(
-            state.bankroll_init + state.closed_pnl,
-            state.cash_usd + state.open_exposure,
-        ),
-        "drawdown_pct": 0.0,
+        "total_equity_market_usd": current_market_equity,
+        "total_equity_fair_usd": current_fair_equity,
+        "peak_market_equity_usd": peak_market_equity,
+        "drawdown_pct": round(drawdown_pct, 3),
     }])
     if eq_path.exists():
         existing = pd.read_parquet(eq_path)
@@ -387,7 +669,11 @@ def tick(data_dir: Path, chain_df: pd.DataFrame, *,
               opened=len(opened), closed=len(closed),
               cash_usd=state.cash_usd,
               open_exposure=state.open_exposure,
-              closed_pnl=state.closed_pnl)
+              closed_pnl=state.closed_pnl,
+              sum_mtm_market_usd=float(sum_mtm_market_usd),
+              sum_mtm_fair_usd=float(sum_mtm_fair_usd),
+              total_equity_market=current_market_equity,
+              drawdown_pct=drawdown_pct)
 
     return {
         "as_of_ts": as_of_ts,
@@ -400,4 +686,8 @@ def tick(data_dir: Path, chain_df: pd.DataFrame, *,
         "cash_usd": state.cash_usd,
         "open_exposure": state.open_exposure,
         "closed_pnl": state.closed_pnl,
+        "sum_mtm_market_usd": float(sum_mtm_market_usd),
+        "sum_mtm_fair_usd": float(sum_mtm_fair_usd),
+        "total_equity_market": current_market_equity,
+        "drawdown_pct": drawdown_pct,
     }

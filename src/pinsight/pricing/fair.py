@@ -53,8 +53,9 @@ def price_contract(rnd: RNDFit, spec: ContractSpec) -> FairValue:
     else:
         raise ValueError(f"kind must be 'call' or 'put', got {spec.kind!r}")
 
-    expected_payoff = float(np.trapz(payoff * q, K_grid))
-    second_moment = float(np.trapz(payoff ** 2 * q, K_grid))
+    trapezoid = getattr(np, "trapezoid", np.trapz)
+    expected_payoff = float(trapezoid(payoff * q, K_grid))
+    second_moment = float(trapezoid(payoff ** 2 * q, K_grid))
     var = max(second_moment - expected_payoff ** 2, 0.0)
     std = float(np.sqrt(var))
 

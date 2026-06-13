@@ -32,9 +32,14 @@ def _final_close_price(underlying: str, expiry: date) -> Optional[float]:
     with obs.timed("api", "yahoo.expiry_close",
                    underlying=underlying, expiry=str(expiry)) as t:
         # +1 day to make sure the close-of-expiry-day bar is included.
+        # +2 days to ensure the expiry-day bar is included (yfinance end
+        # is exclusive). Bug 10 fix: previous code used `int and date`
+        # which short-circuits to the date because the int is truthy —
+        # an unintentional no-op left over from an earlier refactor.
+        end_date = date.fromordinal(expiry.toordinal() + 2)
         hist = yf.Ticker(underlying.upper()).history(
             start=expiry.isoformat(),
-            end=(expiry.toordinal() + 2 and date.fromordinal(expiry.toordinal() + 2)).isoformat(),
+            end=end_date.isoformat(),
             interval="1d",
             auto_adjust=False,
         )
@@ -61,10 +66,14 @@ def eval_flags(data_dir: Path, underlying: str, expiry: date,
     df = pd.read_parquet(path)
 
     # If multiple snapshots, use the FIRST one captured — that's when we'd
-    # have decided to act on the flag.
-    if "_snapshot_ts" in df.columns:
-        first_snapshot = df["_snapshot_ts"].min()
-        df = df[df["_snapshot_ts"] == first_snapshot]
+    # have decided to act on the flag. Compare via parsed datetime to
+    # survive mixed Z/+00:00 timestamp formats. (Bug 11 fix, 2026-06-05.)
+    if "_snapshot_ts" in df.columns and not df.empty:
+        ts_parsed = pd.to_datetime(df["_snapshot_ts"], utc=True, errors="coerce")
+        if ts_parsed.notna().any():
+            first_idx = ts_parsed.idxmin()
+            first_snapshot = df.loc[first_idx, "_snapshot_ts"]
+            df = df[df["_snapshot_ts"] == first_snapshot]
 
     cands = _candidates(df)
     if cands.empty:

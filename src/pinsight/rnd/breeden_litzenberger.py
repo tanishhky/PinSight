@@ -51,13 +51,14 @@ def density_from_calls(strikes: np.ndarray, calls: np.ndarray,
     d2C[0] = (calls[2] - 2 * calls[1] + calls[0]) / (h * h)
     d2C[-1] = (calls[-1] - 2 * calls[-2] + calls[-3]) / (h * h)
 
+    trapezoid = getattr(np, "trapezoid", np.trapz)
     q_raw = np.exp(r * T) * d2C
-    raw_total = float(np.trapz(q_raw, strikes))
-    raw_neg = float(np.trapz(np.maximum(-q_raw, 0.0), strikes))
+    raw_total = float(trapezoid(q_raw, strikes))
+    raw_neg = float(trapezoid(np.maximum(-q_raw, 0.0), strikes))
 
     # Clip negatives (Carr-Madan style) and renormalise.
     q = np.maximum(q_raw, 0.0)
-    total = float(np.trapz(q, strikes))
+    total = float(trapezoid(q, strikes))
     if total > 0:
         q = q / total
     cdf = np.concatenate([[0.0], np.cumsum((q[:-1] + q[1:]) / 2.0 * h)])
@@ -71,11 +72,12 @@ def density_from_calls(strikes: np.ndarray, calls: np.ndarray,
 
 def moments(d: BLDensity) -> dict[str, float]:
     """First four moments of the density (for diagnostic / comparison)."""
+    trapezoid = getattr(np, "trapezoid", np.trapz)
     K = d.strikes
     q = d.density
-    mu = float(np.trapz(K * q, K))
-    var = float(np.trapz((K - mu) ** 2 * q, K))
+    mu = float(trapezoid(K * q, K))
+    var = float(trapezoid((K - mu) ** 2 * q, K))
     std = float(np.sqrt(max(var, 1e-12)))
-    skew = float(np.trapz(((K - mu) / std) ** 3 * q, K))
-    kurt = float(np.trapz(((K - mu) / std) ** 4 * q, K)) - 3.0  # excess
+    skew = float(trapezoid(((K - mu) / std) ** 3 * q, K))
+    kurt = float(trapezoid(((K - mu) / std) ** 4 * q, K)) - 3.0
     return {"mean": mu, "std": std, "skew": skew, "kurtosis_excess": kurt}
