@@ -7,12 +7,12 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/tanishkyadav/dev/PinSight/scripts/pinsight-runner.sh</string>
+        <string>/Users/tanishkyadav/Documents/SecondBrain/GitHub/PinSight/scripts/pinsight-runner.sh</string>
         <string>close</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/Users/tanishkyadav/dev/PinSight</string>
+    <string>/Users/tanishkyadav/Documents/SecondBrain/GitHub/PinSight</string>
 
     <key>StartCalendarInterval</key>
     <array>
@@ -24,9 +24,9 @@
     </array>
 
     <key>StandardOutPath</key>
-    <string>/Users/tanishkyadav/dev/PinSight/logs/launchd-close.out</string>
+    <string>/Users/tanishkyadav/Documents/SecondBrain/GitHub/PinSight/logs/launchd-close.out</string>
     <key>StandardErrorPath</key>
-    <string>/Users/tanishkyadav/dev/PinSight/logs/launchd-close.err</string>
+    <string>/Users/tanishkyadav/Documents/SecondBrain/GitHub/PinSight/logs/launchd-close.err</string>
 
     <key>RunAtLoad</key>
     <false/>
