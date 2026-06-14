@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-PROJECT="/Users/tanishkyadav/Documents/SecondBrain/GitHub/PinSight"
+PROJECT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY="${PROJECT}/.venv/bin/python"
 SYMBOL="${SYMBOL:-SPY}"
 

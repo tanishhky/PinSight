@@ -60,3 +60,6 @@ Thumbs.db
 
 # ── Notebooks output (keep code, drop output) ──────────────────────────────
 # Use `jupyter nbconvert --clear-output` before commit, or rely on nbstripout
+
+# machine-specific launchd config (absolute paths) — keep local only
+scripts/launchd/*.plist
