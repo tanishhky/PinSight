@@ -36,6 +36,7 @@ No-lookahead discipline (per ADR-0004):
 
 from __future__ import annotations
 
+import math
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -539,6 +540,18 @@ def tick(data_dir: Path, chain_df: pd.DataFrame, *,
             candidates_evaluated += 1
             entry_fill = _entry_fill_price(mid, ask, bid,
                                              rule.slippage_frac_of_half_spread)
+            # ── Intrinsic-value floor guard (2026-06-22) ──
+            # You cannot buy an option below its intrinsic value — that's an
+            # instant arbitrage that does not exist in a real market. An ITM
+            # strike quoted below intrinsic is stale/crossed/garbage data, NOT
+            # edge. Without this guard the agent "buys free money" on bad ITM
+            # quotes and books phantom profit at settlement (the source of the
+            # implausible +250k paper return: puts +283k / calls -33k). Also
+            # reject any non-finite fill. Legitimate OTM edge trades have
+            # intrinsic == 0 and pass trivially, so the real thesis is intact.
+            intrinsic = _intrinsic(ctype, strike, spot)
+            if not math.isfinite(entry_fill) or entry_fill < intrinsic - 1e-9:
+                continue
             spec = ContractSpec(kind=ctype, strike=strike,
                                  market_premium=mid,
                                  ticker=row.get("ticker"),
