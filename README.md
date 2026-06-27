@@ -14,9 +14,11 @@ PinSight studies zero-days-to-expiration (0DTE) options on SPX/SPY with three co
 
 ## Status
 
-**M1 shipped (2026-05-30):** data ingestion (Yahoo + Polygon adapter), Parquet persistence, flagged-contract inspector, eval-flags backtester, launchd automation (morning/midday/close, Mon-Fri). M2 (RND engine), M3 (pricing), M4 (flow engine) are next.
+**M1-M4 shipped:** data ingestion (Yahoo + Polygon adapter), Parquet persistence, flagged-contract inspector, eval-flags backtester, launchd automation (morning/midday/close, Mon-Fri); the **RND engine** (Breeden-Litzenberger + SVI, BKM cross-check), the **fair-premium pricing** engine, and a no-lookahead **paper trader** (`edge_buyer`) that buys options the RND deems underpriced and settles at intrinsic.
 
-**Operationally:** the project lives at `~/dev/PinSight/`. Three launchd jobs auto-run on the schedule below.
+> **Fill-discipline note (2026-06):** the paper trader now rejects any fill below the option's intrinsic value (an instant arbitrage that does not exist in a real market) and any non-finite fill. An earlier run reported an implausible six-figure return that traced entirely to such garbage ITM quotes; the guard removes the phantom. The paper P&L is a research diagnostic, not a track record.
+
+**Operationally:** the project lives at `~/Documents/SecondBrain/GitHub/PinSight/`. Three launchd jobs auto-run on the schedule below.
 
 ## What's wired up today
 
@@ -45,13 +47,13 @@ US-market holidays handled by a hardcoded calendar in `scripts/pinsight-runner.s
 ## Install / install autorun
 
 ```
-cd ~/dev/PinSight
+cd ~/Documents/SecondBrain/GitHub/PinSight
 python3 -m venv .venv
 .venv/bin/pip install -e .
 ./scripts/launchd/install.sh
 ```
 
-Requires Full Disk Access granted to `/bin/bash` on macOS Sequoia/Sonoma if the project lives in `~/Documents/`. Living in `~/dev/` (the current setup) sidesteps the TCC restriction.
+macOS Sequoia/Sonoma blocks launchd agents from running code under `~/Documents/`. Since the repo lives in `~/Documents/SecondBrain/GitHub/`, Full Disk Access is granted to `/bin/bash` and the venv `python`, with launchd logs written outside `~/Documents/`, so the scheduled jobs run.
 
 ## Why 0DTE
 
