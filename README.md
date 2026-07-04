@@ -30,9 +30,10 @@ PinSight studies zero-days-to-expiration (0DTE) options on SPX/SPY with three co
 | Parquet persistence with append-on-resnapshot | shipped |
 | Observability spine (JSONL events: `obs.timed`, `obs.event`, run summary) | shipped |
 | Auto-runs Mon-Fri | shipped via launchd |
-| RND engine (BL second-deriv + SVI smoothing + BKM cross-check) | planned (M2) |
-| Pricing engine | planned (M3) |
-| Flow engine | planned (M4) |
+| RND engine (BL second-deriv + SVI smoothing + BKM cross-check) | shipped |
+| Fair-premium pricing engine | shipped |
+| Flow / flagged-contract detector + eval-flags backtester | shipped |
+| No-lookahead paper trader (`edge_buyer`, intrinsic-floor fill guard) | shipped |
 
 ## Auto-schedule (launchd, ET, weekdays only)
 

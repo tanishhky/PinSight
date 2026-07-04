@@ -65,10 +65,18 @@ def _poisoned_put_bought(tmp_path: Path) -> bool:
 def test_subintrinsic_buy_happens_without_guard(tmp_path: Path, monkeypatch):
     """Sanity / non-vacuous control: with the intrinsic guard DISABLED
     (monkeypatched to 0), the agent DOES buy the poisoned below-intrinsic
-    put — proving the fixture generates the buy and the bug was real."""
+    put — proving the fixture generates the buy and the bug was real.
+
+    Since 2026-07-04 the model-market divergence gate ALSO refuses this
+    quote (fair/mid = 8x > 2x) — defense in depth. The control therefore
+    relaxes that gate too, so it keeps proving the intrinsic floor is the
+    load-bearing guard being tested here.
+    """
     monkeypatch.setattr(paper, "_intrinsic", lambda kind, strike, spot: 0.0)
+    rule = paper.EntryRule(max_model_market_ratio=float("inf"),
+                           max_rel_spread=float("inf"))
     chain = _chain_with_one_subintrinsic_put(tmp_path)
-    paper.tick(tmp_path, chain,
+    paper.tick(tmp_path, chain, rule=rule,
                as_of_ts="2026-06-01T15:00:00+00:00", expiry_iso="2026-06-01")
     assert _poisoned_put_bought(tmp_path), (
         "control failed: poisoned put not bought even with guard disabled — "

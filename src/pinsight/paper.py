@@ -37,6 +37,7 @@ No-lookahead discipline (per ADR-0004):
 from __future__ import annotations
 
 import math
+import os
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -66,7 +67,35 @@ def _parse_iso(ts: str) -> datetime:
 
 @dataclass(frozen=True)
 class EntryRule:
-    """Tunable knobs for the edge_buyer agent."""
+    """Tunable knobs for the edge_buyer agent.
+
+    2026-07-04 redesign, from the audit of the first 126 post-reset trades
+    (-$21k realized, hit 28.6%):
+
+      * every sub-$0.30 entry lost (0/27, -$26.1k) — all were trades where
+        the RND fair diverged hugely from the market quote (median
+        fair/mid 2.5-4.4x, max 235x). "mid < 0.85 x fair" buys whatever
+        the model MOST overvalues, which is adverse selection against our
+        own model error;
+      * near-money entries ($1+ fills, fair/mid ~1.3x) were PROFITABLE
+        (+$7.4k at ~41% hit);
+      * replaying the same 126 trades with the divergence gate at 2.0x
+        keeps 93 of them and flips total P&L to +$8.7k.
+
+    Three formulated mechanisms replace magic-threshold buying:
+      1. divergence gate — when model fair and market mid disagree by more
+         than `max_model_market_ratio`, model error is the likelier
+         explanation than edge: no trade.
+      2. quote-quality gate — relative spread above `max_rel_spread`
+         means the quote isn't executable at anything near mid and the
+         slippage model is meaningless.
+      3. conviction sizing — fractional Kelly on the shrunk edge (fair
+         blended toward mid in log space with `model_trust_weight`),
+         replacing the fixed full-cap budget that put ~$1,000 on 167
+         nickel contracts as happily as on an ATM straddle leg.
+
+    All knobs env-overridable via PINSIGHT_* (see from_env).
+    """
     entry_edge_max: float = 0.85
     entry_prob_min: float = 0.20
     min_hours_before_open: float = 1.0
@@ -78,6 +107,49 @@ class EntryRule:
     commission_per_contract: float = 0.35
     slippage_frac_of_half_spread: float = 0.25
     fees_per_contract: float = 0.0
+    # Model-error and quote-quality gates (2026-07-04)
+    max_model_market_ratio: float = 2.0
+    max_rel_spread: float = 0.15
+    # Conviction sizing: posterior log-fair = (1-w)*log(mid) + w*log(fair)
+    # (w = trust in our model vs the market's price), then fractional
+    # Kelly at `kelly_fraction` on the blended edge.
+    model_trust_weight: float = 0.5
+    kelly_fraction: float = 0.25
+
+    @classmethod
+    def from_env(cls) -> "EntryRule":
+        """EntryRule with PINSIGHT_* environment overrides applied."""
+        def f(name: str, default: float) -> float:
+            try:
+                return float(os.getenv(name, str(default)))
+            except (TypeError, ValueError):
+                return default
+        d = cls()
+        return cls(
+            entry_edge_max=f("PINSIGHT_ENTRY_EDGE_MAX", d.entry_edge_max),
+            entry_prob_min=f("PINSIGHT_ENTRY_PROB_MIN", d.entry_prob_min),
+            min_hours_before_open=f("PINSIGHT_MIN_HOURS_BEFORE_OPEN",
+                                    d.min_hours_before_open),
+            min_mid=f("PINSIGHT_MIN_MID", d.min_mid),
+            per_position_cap_pct=f("PINSIGHT_PER_POSITION_CAP_PCT",
+                                   d.per_position_cap_pct),
+            aggregate_cap_pct=f("PINSIGHT_AGGREGATE_CAP_PCT",
+                                d.aggregate_cap_pct),
+            min_position_usd=f("PINSIGHT_MIN_POSITION_USD",
+                               d.min_position_usd),
+            commission_per_contract=f("PINSIGHT_COMMISSION_PER_CONTRACT",
+                                      d.commission_per_contract),
+            slippage_frac_of_half_spread=f(
+                "PINSIGHT_SLIPPAGE_FRAC", d.slippage_frac_of_half_spread),
+            fees_per_contract=f("PINSIGHT_FEES_PER_CONTRACT",
+                                d.fees_per_contract),
+            max_model_market_ratio=f("PINSIGHT_MAX_MODEL_MARKET_RATIO",
+                                     d.max_model_market_ratio),
+            max_rel_spread=f("PINSIGHT_MAX_REL_SPREAD", d.max_rel_spread),
+            model_trust_weight=f("PINSIGHT_MODEL_TRUST_WEIGHT",
+                                 d.model_trust_weight),
+            kelly_fraction=f("PINSIGHT_KELLY_FRACTION", d.kelly_fraction),
+        )
 
 
 # ── Persistence paths ────────────────────────────────────────────────────
@@ -402,7 +474,7 @@ def tick(data_dir: Path, chain_df: pd.DataFrame, *,
          bankroll: float = DEFAULT_BANKROLL) -> dict:
     """One paper-tick for the edge_buyer."""
     if rule is None:
-        rule = EntryRule()
+        rule = EntryRule.from_env()
     if as_of_ts is None:
         as_of_ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
     if chain_df is None or chain_df.empty:
@@ -552,41 +624,92 @@ def tick(data_dir: Path, chain_df: pd.DataFrame, *,
             intrinsic = _intrinsic(ctype, strike, spot)
             if not math.isfinite(entry_fill) or entry_fill < intrinsic - 1e-9:
                 continue
+            # ── Quote-quality gate (2026-07-04) ──
+            # A relative spread this wide means "mid" is a fiction: the
+            # quote can't be executed near it and the slippage model no
+            # longer describes anything. Winning trades in the audit had
+            # median rel-spread 0.006-0.008; the 0-for-27 lottery bucket
+            # sat at 0.05-0.11.
+            rel_spread = (ask - bid) / mid
+            if rel_spread > rule.max_rel_spread:
+                continue
             spec = ContractSpec(kind=ctype, strike=strike,
                                  market_premium=mid,
                                  ticker=row.get("ticker"),
                                  expiry=expiry_iso)
             fv = price_contract(rnd, spec)
+            if not math.isfinite(fv.fair_premium) or fv.fair_premium <= 0:
+                continue
+            # ── Model-error gate (2026-07-04) ──
+            # When our fair and the market's mid disagree by more than
+            # max_model_market_ratio, the likelier explanation is that
+            # the RND is wrong at that strike (the audit found "fair
+            # $15.36" on a $0.106 put), not that the market is offering
+            # a free multiple. Replayed on the first 126 trades this
+            # single gate turned -$21k into +$8.7k.
+            div_ratio = fv.fair_premium / mid
+            if div_ratio > rule.max_model_market_ratio:
+                continue
             # Pre-cost edge check (a contract must look cheap before
             # we even think about costs).
             if not (fv.edge_ratio < rule.entry_edge_max
                      and fv.prob_itm >= rule.entry_prob_min):
                 continue
-            # Post-cost EV check: fair premium must exceed fill price
-            # PLUS round-trip per-share costs.
+            # ── Shrunk fair: posterior blend of model and market ──
+            # log(fair_used) = (1-w) log(mid) + w log(fair). With w=0.5
+            # this treats model and market as equally noisy estimators;
+            # the claimed edge is haircut accordingly before EV and
+            # sizing ever see it.
+            w = rule.model_trust_weight
+            fair_used = (mid ** (1.0 - w)) * (fv.fair_premium ** w)
+            # Post-cost EV check on the SHRUNK fair, not the raw model.
             roundtrip_cost_per_share = 2 * per_share_cost_floor
-            net_edge_per_share = (fv.fair_premium - entry_fill
+            net_edge_per_share = (fair_used - entry_fill
                                     - roundtrip_cost_per_share)
             if net_edge_per_share <= 0:
                 continue
-            buys.append((spec, fv, entry_fill, bid, ask))
+            buys.append((spec, fv, entry_fill, bid, ask,
+                         fair_used, div_ratio, rel_spread))
 
         buys.sort(
-            key=lambda x: (x[1].fair_premium - x[2]) * x[1].prob_itm,
+            key=lambda x: (x[5] - x[2]) * x[1].prob_itm,
             reverse=True)
         candidates_buy = len(buys)
 
         per_position_cap_usd = state.bankroll_init * rule.per_position_cap_pct
         agg_cap_usd = state.bankroll_init * rule.aggregate_cap_pct
-        for spec, fv, fill, bid, ask in buys:
+        for spec, fv, fill, bid, ask, fair_used, div_ratio, rel_spread in buys:
             available = agg_cap_usd - state.open_exposure
             if available < rule.min_position_usd:
                 break
-            budget = min(per_position_cap_usd, available, state.cash_usd)
             cost_per_contract_with_fees = (fill * 100.0
                                             + rule.commission_per_contract
                                             + rule.fees_per_contract)
             if cost_per_contract_with_fees <= 0:
+                continue
+            # ── Conviction sizing: fractional Kelly on the shrunk edge ──
+            # Binary approximation of the expiry payoff: win prob
+            # p = model P(ITM); expected payoff conditional on ITM is
+            # fair_used / p (since fair_used ≈ p · E[payoff | ITM]);
+            # odds per $ of cost b = payoff_if_itm / cost - 1.
+            # f* = p - (1-p)/b, applied at kelly_fraction. The old code
+            # spent min(cap, cash) on EVERY signal, which is what put
+            # $1,000 on 167 five-cent contracts. Now conviction scales
+            # the stake and the per-position cap only truncates it.
+            p = fv.prob_itm
+            cost_per_share = fill + 2 * per_share_cost_floor
+            if p <= 0 or cost_per_share <= 0:
+                continue
+            payoff_if_itm = fair_used / p
+            b = payoff_if_itm / cost_per_share - 1.0
+            if b <= 0:
+                continue
+            f_star = p - (1.0 - p) / b
+            if f_star <= 0:
+                continue
+            budget = min(rule.kelly_fraction * f_star * state.bankroll_init,
+                         per_position_cap_usd, available, state.cash_usd)
+            if budget < rule.min_position_usd:
                 continue
             n = int(budget // cost_per_contract_with_fees)
             if n <= 0:
@@ -599,6 +722,13 @@ def tick(data_dir: Path, chain_df: pd.DataFrame, *,
                                   ask=ask, bid=bid,
                                   commission_paid=commission_paid,
                                   fees_paid=fees_paid)
+            # Audit trail for the next post-mortem.
+            pos.update({
+                "fair_used_at_entry": round(fair_used, 4),
+                "model_market_ratio_at_entry": round(div_ratio, 3),
+                "rel_spread_at_entry": round(rel_spread, 4),
+                "kelly_f_at_entry": round(f_star, 4),
+            })
             opened.append(pos)
             total_cost = float(pos["entry_total_cost_usd"])
             state = TraderState(
