@@ -1,5 +1,7 @@
 # PinSight
 
+![tests](https://github.com/tanishhky/PinSight/actions/workflows/tests.yml/badge.svg)
+
 **A free, open research platform for 0DTE options: probability distribution inference, fair-premium pricing, and unusual flow detection.**
 
 PinSight studies zero-days-to-expiration (0DTE) options on SPX/SPY with three coupled goals:
