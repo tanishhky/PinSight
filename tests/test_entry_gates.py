@@ -147,3 +147,19 @@ def test_min_position_floor_skips_dust_stakes(tmp_path, monkeypatch):
     trades = _run_tick(tmp_path, monkeypatch, chain, fairs,
                        paper.EntryRule())
     assert trades.empty
+
+
+def test_saturated_prob_itm_cannot_max_kelly(tmp_path, monkeypatch):
+    """Live artifact 2026-07-06: the integrated RND returned P(ITM)=1.0
+    exactly for a near-money put, sending f* to 1 regardless of edge.
+    Sizing must clamp the probability below 1 and stamp kelly_f < 1."""
+    chain = _chain([{"ticker": "SAT", "contract_type": "put",
+                     "strike": 590.0, "bid": 2.38, "ask": 2.40,
+                     "mid": 2.39}])
+    fairs = {590.0: (2.82, 1.0)}   # ratio 1.18: passes gates; p saturated
+    trades = _run_tick(tmp_path, monkeypatch, chain, fairs,
+                       paper.EntryRule())
+    assert len(trades) == 1
+    t = trades.iloc[0]
+    assert t["kelly_f_at_entry"] < 1.0, (
+        "saturated P(ITM)=1.0 still produced full-Kelly sizing")

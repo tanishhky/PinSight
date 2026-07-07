@@ -115,6 +115,13 @@ class EntryRule:
     # Kelly at `kelly_fraction` on the blended edge.
     model_trust_weight: float = 0.5
     kelly_fraction: float = 0.25
+    # Sizing probability cap (2026-07-07): the RND's numerically
+    # integrated P(ITM) can saturate to exactly 1.0 near the money (grid
+    # artifact, observed live on the first post-redesign session). At
+    # p=1 the Kelly fraction becomes 1 regardless of edge and only the
+    # per-position cap contains the bet. No same-day option has a true
+    # 100% ITM probability, so the sizing input is clamped below 1.
+    prob_itm_sizing_cap: float = 0.95
 
     @classmethod
     def from_env(cls) -> "EntryRule":
@@ -149,6 +156,8 @@ class EntryRule:
             model_trust_weight=f("PINSIGHT_MODEL_TRUST_WEIGHT",
                                  d.model_trust_weight),
             kelly_fraction=f("PINSIGHT_KELLY_FRACTION", d.kelly_fraction),
+            prob_itm_sizing_cap=f("PINSIGHT_PROB_ITM_SIZING_CAP",
+                                  d.prob_itm_sizing_cap),
         )
 
 
@@ -696,7 +705,10 @@ def tick(data_dir: Path, chain_df: pd.DataFrame, *,
             # spent min(cap, cash) on EVERY signal, which is what put
             # $1,000 on 167 five-cent contracts. Now conviction scales
             # the stake and the per-position cap only truncates it.
-            p = fv.prob_itm
+            # Clamp the sizing probability below 1: integrated-RND P(ITM)
+            # saturates to exactly 1.0 near the money, which sends f* to 1
+            # regardless of edge (see prob_itm_sizing_cap).
+            p = min(fv.prob_itm, rule.prob_itm_sizing_cap)
             cost_per_share = fill + 2 * per_share_cost_floor
             if p <= 0 or cost_per_share <= 0:
                 continue
